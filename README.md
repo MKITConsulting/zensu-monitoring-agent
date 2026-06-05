@@ -1,12 +1,15 @@
 # zensu-agent
 
+[![License: FSL-1.1-Apache-2.0](https://img.shields.io/badge/License-FSL--1.1--Apache--2.0-blue.svg)](LICENSE)
+
 Outbound **push/heartbeat** agent that reports the runtime status of your
 Kubernetes workloads to [Zensu](https://zensu.dev) — powering the
 "Is everything running?" view with per-service **up / degraded / down** status
 and uptime.
 
-It is the open-source half of Zensu's split-trust model: this agent (Apache-2.0)
-runs in **your** cluster and only ever makes **outbound** calls to the Zensu API.
+It is the source-available half of Zensu's split-trust model: this agent
+([FSL-1.1-Apache-2.0](LICENSE)) runs in **your** cluster and only ever makes
+**outbound** calls to the Zensu API.
 Zensu never reaches into your network. Don't want to run it? The heartbeat API is
 a documented public contract — point anything at it (see [Contract](#contract)).
 
@@ -109,4 +112,6 @@ docker build -t zensu-agent .
 
 ## License
 
-[Apache-2.0](LICENSE) © MK IT Consulting
+[FSL-1.1-Apache-2.0](LICENSE) © Zensu — source-available under the Functional
+Source License, converting to Apache-2.0 two years after each release (same
+license as the [zensu-claude-code](https://github.com/MKITConsulting/zensu-claude-code) plugin).
