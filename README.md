@@ -52,12 +52,19 @@ privilege).
 
 ## Trust / security
 
-- **Least privilege.** The bundled RBAC grants only `get/list/watch` on
+- **Least privilege (cluster).** The bundled RBAC grants only `get/list/watch` on
   `deployments` and `pods` (Pods are read solely to total restart counts) plus
   `get/list` on `metrics.k8s.io` `pods` (read-only CPU/memory usage; harmless if
   metrics-server is absent). The agent cannot create, update, patch, or delete
   anything — see
   [`helm/zensu-agent/templates/rbac.yaml`](helm/zensu-agent/templates/rbac.yaml).
+- **Least privilege (API key).** The heartbeat endpoint accepts the dedicated
+  narrow **`runtime`** scope, so mint the agent's key with *only* that scope
+  (Zensu → Settings → API Keys → check **runtime**, leave read/write unchecked).
+  Such a key can reach **only** `POST /api/runtime/heartbeat` — every other
+  endpoint returns `403 forbidden`, so a leaked agent key cannot mutate your data.
+  A broad `write` (or `admin`) key still works for backward compatibility, but
+  over-privileges an ingest-only client and is discouraged.
 - **Outbound-only egress.** The single network call is the heartbeat POST to the
   `ZENSU_API_URL` you configure — no inbound ports, no other destinations. See
   [`internal/agent/reporter.go`](internal/agent/reporter.go).
@@ -88,7 +95,7 @@ metadata:
 | Env | Required | Default | Description |
 |---|---|---|---|
 | `ZENSU_API_URL` | yes | — | Zensu API base URL |
-| `ZENSU_API_KEY` | yes | — | API key (`zsk_...`) |
+| `ZENSU_API_KEY` | yes | — | API key (`zsk_...`); mint with only the `runtime` scope — see [Trust / security](#trust--security) |
 | `ZENSU_PRODUCT_ID` | yes | — | Product UUID to report to |
 | `ZENSU_AGENT_INTERVAL` | no | `60s` | Heartbeat cadence (Go duration) |
 | `ZENSU_AGENT_NAMESPACES` | no | `default` | Comma-separated namespaces to scan |
