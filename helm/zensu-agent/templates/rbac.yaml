@@ -1,6 +1,6 @@
 {{- if .Values.rbac.create }}
-# Least privilege: read-only access to Deployments and Pods. The agent never
-# creates, updates, patches, or deletes anything.
+# Least privilege: read-only access to Deployments, Pods, and pod metrics. The
+# agent never creates, updates, patches, or deletes anything.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -14,6 +14,11 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # Read per-pod CPU/memory from metrics-server. Absent on clusters without
+  # metrics-server; the agent degrades gracefully (heartbeat without metrics).
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

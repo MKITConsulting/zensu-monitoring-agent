@@ -26,7 +26,9 @@ agent:
   schedule: "*/1 * * * *"
 
 rbac:
-  # Create the read-only ClusterRole + binding (get/list/watch deployments and pods).
+  # Create the read-only ClusterRole + binding: get/list/watch deployments and
+  # pods, plus get/list on metrics.k8s.io pods (per-service CPU/memory; optional —
+  # the agent degrades gracefully on clusters without metrics-server).
   create: true
 
 serviceAccount:
