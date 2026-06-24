@@ -37,6 +37,19 @@ the `metrics` array, and keeps sending heartbeats — status and `restartCount`
 are unaffected. A transient metrics-server error skips metrics for that one tick
 only; the heartbeat still goes out.
 
+**Enabling CPU/memory.** metrics-server is not a Kubernetes default. Managed clusters
+(GKE, AKS, k3s) usually ship it; EKS, kubeadm, and most bare-metal clusters do not. If
+it is absent and you want CPU/memory (uptime needs nothing), install the standard,
+free add-on:
+
+```sh
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+```
+
+On clusters that standardize on Prometheus instead, a Prometheus-backed source is on the
+roadmap (read the customer's existing Prometheus over PromQL, no extra cluster
+privilege).
+
 ## Trust / security
 
 - **Least privilege.** The bundled RBAC grants only `get/list/watch` on
