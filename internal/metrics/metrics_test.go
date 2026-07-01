@@ -44,7 +44,7 @@ func TestNewServesMetrics(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), `zensu_agent_heartbeat_total{result="success"} 1`) {
+	if !strings.Contains(string(body), `zensu_monitoring_agent_heartbeat_total{result="success"} 1`) {
 		t.Errorf("New() registry missing recorded series; body:\n%s", string(body))
 	}
 }
@@ -76,9 +76,9 @@ func TestPostDurationHistogramBuckets(t *testing.T) {
 	text := string(body)
 
 	for _, want := range []string{
-		`zensu_agent_post_duration_seconds_bucket{le="0.1"} 0`,
-		`zensu_agent_post_duration_seconds_bucket{le="0.25"} 1`,
-		"zensu_agent_post_duration_seconds_count 1",
+		`zensu_monitoring_agent_post_duration_seconds_bucket{le="0.1"} 0`,
+		`zensu_monitoring_agent_post_duration_seconds_bucket{le="0.25"} 1`,
+		"zensu_monitoring_agent_post_duration_seconds_count 1",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("histogram missing %q (unit bug?); body:\n%s", want, text)
@@ -130,11 +130,11 @@ func TestHandlerServesSeries(t *testing.T) {
 	text := string(body)
 
 	for _, want := range []string{
-		"zensu_agent_heartbeat_total",
-		`zensu_agent_heartbeat_total{result="success"} 1`,
-		"zensu_agent_last_success_timestamp_seconds",
-		"zensu_agent_post_duration_seconds_count 1",
-		"zensu_agent_services_reported 2",
+		"zensu_monitoring_agent_heartbeat_total",
+		`zensu_monitoring_agent_heartbeat_total{result="success"} 1`,
+		"zensu_monitoring_agent_last_success_timestamp_seconds",
+		"zensu_monitoring_agent_post_duration_seconds_count 1",
+		"zensu_monitoring_agent_services_reported 2",
 		"go_goroutines",
 		"process_start_time_seconds",
 	} {

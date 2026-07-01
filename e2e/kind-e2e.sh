@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end test: run the real zensu-agent image inside a real Kubernetes
+# End-to-end test: run the real zensu-monitoring-agent image inside a real Kubernetes
 # cluster (kind), pointed at an in-cluster mock receiver, and assert that a
 # heartbeat POST arrives for an annotated Deployment — exercising the actual
 # shipping artifacts (image, Helm chart, RBAC, in-cluster config, client-go
@@ -18,9 +18,9 @@
 # Usage: KIND=/path/to/kind bash e2e/kind-e2e.sh   (KIND defaults to `kind`)
 set -euo pipefail
 
-CLUSTER="${CLUSTER:-zensu-agent-e2e}"
-NS="${NS:-zensu-agent-e2e}"
-IMAGE="zensu-agent:e2e"
+CLUSTER="${CLUSTER:-zensu-monitoring-agent-e2e}"
+NS="${NS:-zensu-monitoring-agent-e2e}"
+IMAGE="zensu-monitoring-agent:e2e"
 KIND="${KIND:-kind}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # Where to pull the metrics-server manifest from, and how long to wait for it to
@@ -127,10 +127,10 @@ YAML
 kubectl -n "$NS" rollout status deploy/demo-api --timeout=120s
 
 echo "==> [7/8] install agent via Helm (deployment mode, 5s interval)"
-helm install zensu-agent "$ROOT/helm/zensu-agent" \
+helm install zensu-monitoring-agent "$ROOT/helm/zensu-monitoring-agent" \
   --namespace "$NS" \
-  --set fullnameOverride=zensu-agent \
-  --set image.repository=zensu-agent \
+  --set fullnameOverride=zensu-monitoring-agent \
+  --set image.repository=zensu-monitoring-agent \
   --set image.tag=e2e \
   --set image.pullPolicy=IfNotPresent \
   --set zensu.apiUrl=http://mock-backend \
@@ -139,10 +139,10 @@ helm install zensu-agent "$ROOT/helm/zensu-agent" \
   --set agent.mode=deployment \
   --set agent.intervalSeconds=5 \
   --set "agent.namespaces[0]=$NS"
-if ! kubectl -n "$NS" rollout status deploy/zensu-agent --timeout=90s; then
+if ! kubectl -n "$NS" rollout status deploy/zensu-monitoring-agent --timeout=90s; then
   echo "--- agent did not become ready; diagnostics (cluster left running) ---"
   kubectl -n "$NS" get pods -o wide
-  POD="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=zensu-agent -o name | head -1)"
+  POD="$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=zensu-monitoring-agent -o name | head -1)"
   kubectl -n "$NS" describe "$POD" | sed -n '/Events:/,$p'
   kubectl -n "$NS" logs "$POD" --tail=40 2>&1 || true
   kubectl -n "$NS" logs "$POD" --previous --tail=40 2>&1 || true
@@ -164,7 +164,7 @@ done
 
 if ! $ok; then
   echo "FAIL: no heartbeat POST observed within timeout"
-  echo "--- agent logs ---"; kubectl -n "$NS" logs deploy/zensu-agent --tail=40 || true
+  echo "--- agent logs ---"; kubectl -n "$NS" logs deploy/zensu-monitoring-agent --tail=40 || true
   exit 1
 fi
 

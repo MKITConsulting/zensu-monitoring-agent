@@ -22,8 +22,8 @@ func TestEnvBool(t *testing.T) {
 		{"garbage", true, false},
 	}
 	for _, c := range cases {
-		t.Setenv("ZENSU_AGENT_TEST_BOOL", c.val)
-		if got := envBool("ZENSU_AGENT_TEST_BOOL", c.def); got != c.want {
+		t.Setenv("ZENSU_MONITORING_AGENT_TEST_BOOL", c.val)
+		if got := envBool("ZENSU_MONITORING_AGENT_TEST_BOOL", c.def); got != c.want {
 			t.Errorf("envBool(val=%q, def=%v) = %v, want %v", c.val, c.def, got, c.want)
 		}
 	}

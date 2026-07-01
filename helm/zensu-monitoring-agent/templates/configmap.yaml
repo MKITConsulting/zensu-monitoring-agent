@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "zensu-monitoring-agent.fullname" . }}
+  labels:
+    {{- include "zensu-monitoring-agent.labels" . | nindent 4 }}
+data:
+  ZENSU_API_URL: {{ required "zensu.apiUrl is required" .Values.zensu.apiUrl | quote }}
+  ZENSU_PRODUCT_ID: {{ required "zensu.productId is required" .Values.zensu.productId | quote }}
+  ZENSU_MONITORING_AGENT_SOURCE: {{ .Values.zensu.source | quote }}
+  ZENSU_MONITORING_AGENT_INTERVAL: {{ printf "%ds" (int .Values.agent.intervalSeconds) | quote }}
+  ZENSU_MONITORING_AGENT_NAMESPACES: {{ include "zensu-monitoring-agent.namespaces" . | quote }}

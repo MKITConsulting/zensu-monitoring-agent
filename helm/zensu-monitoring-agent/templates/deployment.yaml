@@ -2,14 +2,14 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "zensu-agent.fullname" . }}
+  name: {{ include "zensu-monitoring-agent.fullname" . }}
   labels:
-    {{- include "zensu-agent.labels" . | nindent 4 }}
+    {{- include "zensu-monitoring-agent.labels" . | nindent 4 }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      {{- include "zensu-agent.selectorLabels" . | nindent 6 }}
+      {{- include "zensu-monitoring-agent.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       {{- if and .Values.metrics.enabled .Values.metrics.podAnnotations }}
@@ -19,9 +19,9 @@ spec:
         prometheus.io/path: /metrics
       {{- end }}
       labels:
-        {{- include "zensu-agent.selectorLabels" . | nindent 8 }}
+        {{- include "zensu-monitoring-agent.selectorLabels" . | nindent 8 }}
     spec:
-      serviceAccountName: {{ include "zensu-agent.serviceAccountName" . }}
+      serviceAccountName: {{ include "zensu-monitoring-agent.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -38,14 +38,14 @@ spec:
           {{- end }}
           envFrom:
             - configMapRef:
-                name: {{ include "zensu-agent.fullname" . }}
+                name: {{ include "zensu-monitoring-agent.fullname" . }}
             - secretRef:
-                name: {{ include "zensu-agent.secretName" . }}
+                name: {{ include "zensu-monitoring-agent.secretName" . }}
           {{- if .Values.metrics.enabled }}
           env:
-            - name: ZENSU_AGENT_METRICS_ENABLED
+            - name: ZENSU_MONITORING_AGENT_METRICS_ENABLED
               value: "true"
-            - name: ZENSU_AGENT_METRICS_ADDR
+            - name: ZENSU_MONITORING_AGENT_METRICS_ADDR
               value: ":{{ .Values.metrics.port }}"
           readinessProbe:
             httpGet:
@@ -55,7 +55,7 @@ spec:
             periodSeconds: 30
           {{- else }}
           env:
-            - name: ZENSU_AGENT_METRICS_ENABLED
+            - name: ZENSU_MONITORING_AGENT_METRICS_ENABLED
               value: "false"
           {{- end }}
           resources:

@@ -28,20 +28,20 @@ func NewWithRegistry(reg *prometheus.Registry) *Metrics {
 	m := &Metrics{
 		registry: reg,
 		heartbeats: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "zensu_agent_heartbeat_total",
+			Name: "zensu_monitoring_agent_heartbeat_total",
 			Help: "Total heartbeat POSTs by result (success|error).",
 		}, []string{"result"}),
 		lastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "zensu_agent_last_success_timestamp_seconds",
+			Name: "zensu_monitoring_agent_last_success_timestamp_seconds",
 			Help: "Unix timestamp of the last successful heartbeat POST.",
 		}),
 		postDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
-			Name:    "zensu_agent_post_duration_seconds",
+			Name:    "zensu_monitoring_agent_post_duration_seconds",
 			Help:    "Duration of heartbeat POSTs in seconds.",
 			Buckets: prometheus.DefBuckets,
 		}),
 		servicesReported: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "zensu_agent_services_reported",
+			Name: "zensu_monitoring_agent_services_reported",
 			Help: "Number of services in the last successful heartbeat batch.",
 		}),
 	}

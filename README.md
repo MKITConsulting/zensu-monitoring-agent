@@ -1,4 +1,4 @@
-# zensu-agent
+# zensu-monitoring-agent
 
 [![License: FSL-1.1-Apache-2.0](https://img.shields.io/badge/License-FSL--1.1--Apache--2.0-blue.svg)](LICENSE)
 
@@ -57,7 +57,7 @@ privilege).
   `get/list` on `metrics.k8s.io` `pods` (read-only CPU/memory usage; harmless if
   metrics-server is absent). The agent cannot create, update, patch, or delete
   anything — see
-  [`helm/zensu-agent/templates/rbac.yaml`](helm/zensu-agent/templates/rbac.yaml).
+  [`helm/zensu-monitoring-agent/templates/rbac.yaml`](helm/zensu-monitoring-agent/templates/rbac.yaml).
 - **Least privilege (API key).** The heartbeat endpoint accepts the dedicated
   narrow **`runtime`** scope, so mint the agent's key with *only* that scope
   (Zensu → Settings → API Keys → check **runtime**, leave read/write unchecked).
@@ -75,8 +75,8 @@ privilege).
 ## Quickstart (Helm)
 
 ```bash
-helm install zensu-agent ./helm/zensu-agent \
-  --namespace zensu-agent --create-namespace \
+helm install zensu-monitoring-agent ./helm/zensu-monitoring-agent \
+  --namespace zensu-monitoring-agent --create-namespace \
   --set zensu.apiUrl=https://api.zensu.dev \
   --set zensu.productId=<your-product-uuid> \
   --set zensu.apiKey=zsk_xxx
@@ -97,16 +97,16 @@ metadata:
 | `ZENSU_API_URL` | yes | — | Zensu API base URL |
 | `ZENSU_API_KEY` | yes | — | API key (`zsk_...`); mint with only the `runtime` scope — see [Trust / security](#trust--security) |
 | `ZENSU_PRODUCT_ID` | yes | — | Product UUID to report to |
-| `ZENSU_AGENT_INTERVAL` | no | `60s` | Heartbeat cadence (Go duration) |
-| `ZENSU_AGENT_NAMESPACES` | no | `default` | Comma-separated namespaces to scan |
-| `ZENSU_AGENT_SOURCE` | no | `k8s-agent` | Source label attached to heartbeats |
-| `ZENSU_AGENT_METRICS_ENABLED` | no | `true` | Serve the Prometheus `/metrics` endpoint (deployment mode only) |
-| `ZENSU_AGENT_METRICS_ADDR` | no | `:2112` | Listen address for the `/metrics` endpoint |
+| `ZENSU_MONITORING_AGENT_INTERVAL` | no | `60s` | Heartbeat cadence (Go duration) |
+| `ZENSU_MONITORING_AGENT_NAMESPACES` | no | `default` | Comma-separated namespaces to scan |
+| `ZENSU_MONITORING_AGENT_SOURCE` | no | `k8s-agent` | Source label attached to heartbeats |
+| `ZENSU_MONITORING_AGENT_METRICS_ENABLED` | no | `true` | Serve the Prometheus `/metrics` endpoint (deployment mode only) |
+| `ZENSU_MONITORING_AGENT_METRICS_ADDR` | no | `:2112` | Listen address for the `/metrics` endpoint |
 
 Helm values mirror these under `zensu.*` / `agent.*`, and the metrics toggles
 live under `metrics.*` (the metrics env vars are wired into the Deployment
 automatically when `metrics.enabled=true`) — see
-[`values.yaml`](helm/zensu-agent/values.yaml). Supply the API key out-of-band with
+[`values.yaml`](helm/zensu-monitoring-agent/values.yaml). Supply the API key out-of-band with
 `zensu.existingSecret` (a Secret holding key `ZENSU_API_KEY`) instead of
 `zensu.apiKey`.
 
@@ -135,10 +135,10 @@ Exposed series (plus the standard `go_*` / `process_*` collectors):
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `zensu_agent_heartbeat_total{result="success\|error"}` | counter | Heartbeat POSTs by outcome |
-| `zensu_agent_last_success_timestamp_seconds` | gauge | Unix time of the last successful POST (alert on staleness) |
-| `zensu_agent_post_duration_seconds` | histogram | Heartbeat POST latency |
-| `zensu_agent_services_reported` | gauge | Services in the last successful batch |
+| `zensu_monitoring_agent_heartbeat_total{result="success\|error"}` | counter | Heartbeat POSTs by outcome |
+| `zensu_monitoring_agent_last_success_timestamp_seconds` | gauge | Unix time of the last successful POST (alert on staleness) |
+| `zensu_monitoring_agent_post_duration_seconds` | histogram | Heartbeat POST latency |
+| `zensu_monitoring_agent_services_reported` | gauge | Services in the last successful batch |
 
 Enable scraping one of two ways:
 
@@ -155,7 +155,7 @@ helm upgrade ... --set metrics.podAnnotations=true
 ```
 
 Disable entirely with `--set metrics.enabled=false`. A useful staleness alert is
-`time() - zensu_agent_last_success_timestamp_seconds > 300` (no successful
+`time() - zensu_monitoring_agent_last_success_timestamp_seconds > 300` (no successful
 heartbeat in 5 minutes). Note that the deployment's readiness probe targets
 `/metrics`, so `metrics.enabled=false` leaves the agent with no readiness probe
 (it has no other health surface).
@@ -219,9 +219,9 @@ change.
 ## Build from source
 
 ```bash
-go build ./cmd/zensu-agent
+go build ./cmd/zensu-monitoring-agent
 go test ./...
-docker build -t zensu-agent .
+docker build -t zensu-monitoring-agent .
 ```
 
 ## License

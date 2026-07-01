@@ -2,16 +2,16 @@
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: {{ include "zensu-agent.fullname" . }}
+  name: {{ include "zensu-monitoring-agent.fullname" . }}
   labels:
-    {{- include "zensu-agent.labels" . | nindent 4 }}
+    {{- include "zensu-monitoring-agent.labels" . | nindent 4 }}
     {{- with .Values.metrics.serviceMonitor.additionalLabels }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
   selector:
     matchLabels:
-      {{- include "zensu-agent.selectorLabels" . | nindent 6 }}
+      {{- include "zensu-monitoring-agent.selectorLabels" . | nindent 6 }}
   endpoints:
     - port: metrics
       path: /metrics

@@ -11,7 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/kubernetes/fake"
 
-	obs "github.com/MKITConsulting/zensu-agent/internal/metrics"
+	obs "github.com/MKITConsulting/zensu-monitoring-agent/internal/metrics"
 )
 
 func scrapeMetrics(t *testing.T, m *obs.Metrics) string {
@@ -36,10 +36,10 @@ func TestReporterInstrumentsSuccess(t *testing.T) {
 	}
 
 	body := scrapeMetrics(t, m)
-	if !strings.Contains(body, `zensu_agent_heartbeat_total{result="success"} 1`) {
+	if !strings.Contains(body, `zensu_monitoring_agent_heartbeat_total{result="success"} 1`) {
 		t.Errorf("missing success counter; body:\n%s", body)
 	}
-	if !strings.Contains(body, "zensu_agent_post_duration_seconds_count 1") {
+	if !strings.Contains(body, "zensu_monitoring_agent_post_duration_seconds_count 1") {
 		t.Errorf("missing post_duration observation; body:\n%s", body)
 	}
 }
@@ -58,10 +58,10 @@ func TestReporterInstrumentsError(t *testing.T) {
 	}
 
 	body := scrapeMetrics(t, m)
-	if !strings.Contains(body, `zensu_agent_heartbeat_total{result="error"} 1`) {
+	if !strings.Contains(body, `zensu_monitoring_agent_heartbeat_total{result="error"} 1`) {
 		t.Errorf("missing error counter; body:\n%s", body)
 	}
-	if !strings.Contains(body, `zensu_agent_heartbeat_total{result="success"} 0`) {
+	if !strings.Contains(body, `zensu_monitoring_agent_heartbeat_total{result="success"} 0`) {
 		t.Errorf("success counter should remain 0; body:\n%s", body)
 	}
 }
@@ -79,7 +79,7 @@ func TestReporterInstrumentsTransportError(t *testing.T) {
 	}
 
 	body := scrapeMetrics(t, m)
-	if !strings.Contains(body, `zensu_agent_heartbeat_total{result="error"} 1`) {
+	if !strings.Contains(body, `zensu_monitoring_agent_heartbeat_total{result="error"} 1`) {
 		t.Errorf("transport failure should count as error; body:\n%s", body)
 	}
 }
@@ -109,7 +109,7 @@ func TestTickSetsServicesReported(t *testing.T) {
 	}
 
 	body := scrapeMetrics(t, m)
-	if !strings.Contains(body, "zensu_agent_services_reported 1") {
+	if !strings.Contains(body, "zensu_monitoring_agent_services_reported 1") {
 		t.Errorf("services_reported should be 1 after a 1-service tick; body:\n%s", body)
 	}
 }

@@ -1,4 +1,4 @@
-// Command zensu-agent reports the runtime status of annotated Kubernetes
+// Command zensu-monitoring-agent reports the runtime status of annotated Kubernetes
 // workloads to the Zensu API using an outbound push/heartbeat model.
 //
 // It reads (never mutates) Deployments carrying the `zensu.dev/service`
@@ -18,8 +18,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/MKITConsulting/zensu-agent/internal/agent"
-	obs "github.com/MKITConsulting/zensu-agent/internal/metrics"
+	"github.com/MKITConsulting/zensu-monitoring-agent/internal/agent"
+	obs "github.com/MKITConsulting/zensu-monitoring-agent/internal/metrics"
 )
 
 func main() {
@@ -38,9 +38,9 @@ func main() {
 
 	cfg := agent.Config{
 		ProductID:  productID,
-		Source:     envOr("ZENSU_AGENT_SOURCE", "k8s-agent"),
-		Namespaces: envList("ZENSU_AGENT_NAMESPACES", []string{"default"}),
-		Interval:   envDuration("ZENSU_AGENT_INTERVAL", 60*time.Second),
+		Source:     envOr("ZENSU_MONITORING_AGENT_SOURCE", "k8s-agent"),
+		Namespaces: envList("ZENSU_MONITORING_AGENT_NAMESPACES", []string{"default"}),
+		Interval:   envDuration("ZENSU_MONITORING_AGENT_INTERVAL", 60*time.Second),
 	}
 
 	lister, err := agent.NewInClusterLister()
@@ -54,11 +54,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if envBool("ZENSU_AGENT_METRICS_ENABLED", true) && !*once {
+	if envBool("ZENSU_MONITORING_AGENT_METRICS_ENABLED", true) && !*once {
 		m := obs.New()
 		reporter.Metrics = m
 		a.Metrics = m
-		addr := envOr("ZENSU_AGENT_METRICS_ADDR", obs.DefaultAddr)
+		addr := envOr("ZENSU_MONITORING_AGENT_METRICS_ADDR", obs.DefaultAddr)
 		log.Info("metrics endpoint enabled", "addr", addr, "path", "/metrics")
 		go func() {
 			if err := m.Serve(ctx, addr); err != nil && ctx.Err() == nil {

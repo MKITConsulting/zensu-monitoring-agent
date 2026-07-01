@@ -2,13 +2,13 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "zensu-agent.fullname" . }}-metrics
+  name: {{ include "zensu-monitoring-agent.fullname" . }}-metrics
   labels:
-    {{- include "zensu-agent.labels" . | nindent 4 }}
+    {{- include "zensu-monitoring-agent.labels" . | nindent 4 }}
 spec:
   type: ClusterIP
   selector:
-    {{- include "zensu-agent.selectorLabels" . | nindent 4 }}
+    {{- include "zensu-monitoring-agent.selectorLabels" . | nindent 4 }}
   ports:
     - name: metrics
       port: {{ .Values.metrics.port }}

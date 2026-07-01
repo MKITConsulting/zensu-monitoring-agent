@@ -22,9 +22,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
-      - run: helm lint helm/zensu-agent
+      - run: helm lint helm/zensu-monitoring-agent
       - run: |
-          helm template t helm/zensu-agent \
+          helm template t helm/zensu-monitoring-agent \
             --set zensu.apiUrl=https://api.zensu.dev \
             --set zensu.productId=00000000-0000-0000-0000-000000000000 \
             --set zensu.apiKey=zsk_test > /dev/null

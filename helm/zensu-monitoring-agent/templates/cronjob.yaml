@@ -2,9 +2,9 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: {{ include "zensu-agent.fullname" . }}
+  name: {{ include "zensu-monitoring-agent.fullname" . }}
   labels:
-    {{- include "zensu-agent.labels" . | nindent 4 }}
+    {{- include "zensu-monitoring-agent.labels" . | nindent 4 }}
 spec:
   schedule: {{ .Values.agent.schedule | quote }}
   concurrencyPolicy: Forbid
@@ -15,10 +15,10 @@ spec:
       template:
         metadata:
           labels:
-            {{- include "zensu-agent.selectorLabels" . | nindent 12 }}
+            {{- include "zensu-monitoring-agent.selectorLabels" . | nindent 12 }}
         spec:
           restartPolicy: Never
-          serviceAccountName: {{ include "zensu-agent.serviceAccountName" . }}
+          serviceAccountName: {{ include "zensu-monitoring-agent.serviceAccountName" . }}
           securityContext:
             {{- toYaml .Values.podSecurityContext | nindent 12 }}
           containers:
@@ -30,9 +30,9 @@ spec:
                 {{- toYaml .Values.securityContext | nindent 16 }}
               envFrom:
                 - configMapRef:
-                    name: {{ include "zensu-agent.fullname" . }}
+                    name: {{ include "zensu-monitoring-agent.fullname" . }}
                 - secretRef:
-                    name: {{ include "zensu-agent.secretName" . }}
+                    name: {{ include "zensu-monitoring-agent.secretName" . }}
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}
 {{- end }}

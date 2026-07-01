@@ -2,13 +2,13 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "zensu-agent.fullname" . }}-metrics
+  name: {{ include "zensu-monitoring-agent.fullname" . }}-metrics
   labels:
-    {{- include "zensu-agent.labels" . | nindent 4 }}
+    {{- include "zensu-monitoring-agent.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      {{- include "zensu-agent.selectorLabels" . | nindent 6 }}
+      {{- include "zensu-monitoring-agent.selectorLabels" . | nindent 6 }}
   policyTypes:
     - Ingress
   ingress:

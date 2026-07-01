@@ -1,4 +1,4 @@
-module github.com/MKITConsulting/zensu-agent
+module github.com/MKITConsulting/zensu-monitoring-agent
 
 go 1.23.0
 

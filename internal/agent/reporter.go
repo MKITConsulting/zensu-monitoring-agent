@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	obs "github.com/MKITConsulting/zensu-agent/internal/metrics"
+	obs "github.com/MKITConsulting/zensu-monitoring-agent/internal/metrics"
 )
 
 // Reporter posts heartbeat batches to the Zensu API over outbound HTTPS. It is

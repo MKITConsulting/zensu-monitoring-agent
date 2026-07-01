@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	obs "github.com/MKITConsulting/zensu-agent/internal/metrics"
+	obs "github.com/MKITConsulting/zensu-monitoring-agent/internal/metrics"
 )
 
 // reporter is the subset of *Reporter the Agent depends on (eases testing).

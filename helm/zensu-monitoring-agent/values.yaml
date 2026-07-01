@@ -1,5 +1,5 @@
 image:
-  repository: ghcr.io/mkitconsulting/zensu-agent
+  repository: ghcr.io/mkitconsulting/zensu-monitoring-agent
   # tag defaults to the chart appVersion when empty
   tag: ""
   pullPolicy: IfNotPresent
