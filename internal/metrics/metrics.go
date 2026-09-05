@@ -12,12 +12,18 @@ import (
 
 const DefaultAddr = ":2112"
 
+// Metrics is the agent's own Prometheus registry and the counters it exports.
+// Every method tolerates a nil receiver, so a caller that ran without
+// ZENSU_MONITORING_AGENT_METRICS_ENABLED needs no branch of its own.
 type Metrics struct {
-	registry         *prometheus.Registry
-	heartbeats       *prometheus.CounterVec
-	lastSuccess      prometheus.Gauge
-	postDuration     prometheus.Histogram
-	servicesReported prometheus.Gauge
+	registry               *prometheus.Registry
+	heartbeats             *prometheus.CounterVec
+	lastSuccess            prometheus.Gauge
+	postDuration           prometheus.Histogram
+	servicesReported       prometheus.Gauge
+	scrapes                *prometheus.CounterVec
+	scrapeDuration         prometheus.Histogram
+	resourceServicesMapped prometheus.Gauge
 }
 
 func New() *Metrics {
@@ -44,12 +50,28 @@ func NewWithRegistry(reg *prometheus.Registry) *Metrics {
 			Name: "zensu_monitoring_agent_services_reported",
 			Help: "Number of services in the last successful heartbeat batch.",
 		}),
+		scrapes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "zensu_monitoring_agent_scrape_total",
+			Help: "Total Prometheus-exposition scrapes by result (success|error).",
+		}, []string{"result"}),
+		scrapeDuration: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name:    "zensu_monitoring_agent_scrape_duration_seconds",
+			Help:    "Duration of Prometheus-exposition scrapes in seconds.",
+			Buckets: prometheus.DefBuckets,
+		}),
+		resourceServicesMapped: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "zensu_monitoring_agent_resource_services_mapped",
+			Help: "Number of services that received resource samples in the last tick, whatever the source.",
+		}),
 	}
 	reg.MustRegister(m.heartbeats, m.lastSuccess, m.postDuration, m.servicesReported)
+	reg.MustRegister(m.scrapes, m.scrapeDuration, m.resourceServicesMapped)
 	reg.MustRegister(collectors.NewGoCollector())
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	m.heartbeats.WithLabelValues("success")
 	m.heartbeats.WithLabelValues("error")
+	m.scrapes.WithLabelValues("success")
+	m.scrapes.WithLabelValues("error")
 	return m
 }
 
@@ -71,6 +93,29 @@ func (m *Metrics) SetServicesReported(n int) {
 		return
 	}
 	m.servicesReported.Set(float64(n))
+}
+
+// RecordScrape counts one exposition scrape and observes its duration.
+func (m *Metrics) RecordScrape(success bool, d time.Duration) {
+	if m == nil {
+		return
+	}
+	if success {
+		m.scrapes.WithLabelValues("success").Inc()
+	} else {
+		m.scrapes.WithLabelValues("error").Inc()
+	}
+	m.scrapeDuration.Observe(d.Seconds())
+}
+
+// SetResourceServicesMapped records how many services received resource samples
+// in the last tick. A healthy scrape with zero mapped services is the signature
+// of a slug-resolution problem, which is otherwise invisible.
+func (m *Metrics) SetResourceServicesMapped(n int) {
+	if m == nil {
+		return
+	}
+	m.resourceServicesMapped.Set(float64(n))
 }
 
 func (m *Metrics) Handler() http.Handler {

@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -25,7 +24,7 @@ const AnnotationService = "zensu.dev/service"
 // on self-hosted clusters: the agent logs it once and keeps sending heartbeats
 // without per-service CPU/memory. Callers should treat it as "metrics not
 // available" rather than a failure of the tick.
-var ErrMetricsAPIUnavailable = errors.New("metrics.k8s.io API not available")
+var ErrMetricsAPIUnavailable = fmt.Errorf("metrics.k8s.io API not available: %w", ErrSourceUnavailable)
 
 // ClusterReader is the minimal read-only Kubernetes surface the agent needs:
 // list Deployments, list the Pods behind a Deployment to sum restarts, and read
@@ -153,6 +152,16 @@ func deploymentSelector(d appsv1.Deployment) string {
 		return ""
 	}
 	return labels.Set(d.Spec.Selector.MatchLabels).AsSelector().String()
+}
+
+// podNames lists the Pod names behind a service, used by metric sources that
+// attribute samples through pod-scoped labels.
+func podNames(pods []corev1.Pod) []string {
+	names := make([]string, 0, len(pods))
+	for _, p := range pods {
+		names = append(names, p.Name)
+	}
+	return names
 }
 
 // sumRestarts totals the container restart counts across the given Pods.

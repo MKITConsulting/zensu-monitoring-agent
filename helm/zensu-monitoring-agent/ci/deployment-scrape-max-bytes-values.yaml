@@ -1,0 +1,7 @@
+# expect: gomemlimit metrics-on scrape-max-bytes
+agent:
+  mode: deployment
+metrics:
+  enabled: true
+resourceMetrics:
+  scrapeMaxBytes: 4194304

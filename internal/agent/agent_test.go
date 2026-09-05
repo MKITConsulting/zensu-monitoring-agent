@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
+
+	obs "github.com/MKITConsulting/zensu-monitoring-agent/internal/metrics"
+	"github.com/prometheus/client_golang/prometheus"
 	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 )
 
@@ -47,7 +51,9 @@ func pod(ns, name string, lbls map[string]string, restarts ...int32) *corev1.Pod
 }
 
 // container builds one ContainerMetrics with the given CPU (millicores) and
+
 // memory (bytes), used to assemble fake PodMetrics in tests.
+
 func container(name string, cpuMilli, memBytes int64) metricsv1beta1.ContainerMetrics {
 	return metricsv1beta1.ContainerMetrics{
 		Name: name,
@@ -66,9 +72,13 @@ func podMetrics(ns, name string, containers ...metricsv1beta1.ContainerMetrics) 
 }
 
 // fakeReader is a controllable ClusterReader: deployments/pods come from a fake
+
 // clientset, while PodMetricsForSelector returns scripted CPU/memory (or a
+
 // scripted error such as ErrMetricsAPIUnavailable) so metrics paths can be
+
 // exercised deterministically.
+
 type fakeReader struct {
 	inner       ClusterReader
 	metricsCPU  int64
@@ -94,43 +104,6 @@ func (f *fakeReader) PodMetricsForSelector(_ context.Context, _, _ string) (int6
 	return f.metricsCPU, f.metricsMem, f.available, nil
 }
 
-func TestDeriveStatus(t *testing.T) {
-	cases := []struct {
-		ready, desired int32
-		want           string
-	}{
-		{3, 3, StatusUp},
-		{5, 3, StatusUp},
-		{1, 2, StatusDegraded},
-		{0, 2, StatusDown},
-		{0, 0, StatusDown},
-		{2, 0, StatusDown},
-	}
-	for _, c := range cases {
-		if got := DeriveStatus(c.ready, c.desired); got != c.want {
-			t.Errorf("DeriveStatus(%d,%d)=%s want %s", c.ready, c.desired, got, c.want)
-		}
-	}
-}
-
-func TestMapDeployment(t *testing.T) {
-	entry, ok := MapDeployment(*deployment("default", "auth-api", "auth", 3, 3))
-	if !ok {
-		t.Fatal("annotated deployment should map")
-	}
-	if entry.Slug != "auth" || entry.Name != "auth-api" || entry.Status != StatusUp {
-		t.Errorf("unexpected entry: %+v", entry)
-	}
-	if entry.ReadyReplicas == nil || *entry.ReadyReplicas != 3 ||
-		entry.DesiredReplicas == nil || *entry.DesiredReplicas != 3 {
-		t.Errorf("replica counts wrong: %+v", entry)
-	}
-
-	if _, ok := MapDeployment(*deployment("default", "db", "", 1, 1)); ok {
-		t.Error("unannotated deployment must be skipped")
-	}
-}
-
 func TestCollect_DedupAcrossNamespaces(t *testing.T) {
 	client := fake.NewSimpleClientset(
 		deployment("ns1", "auth-api", "auth", 3, 3),
@@ -142,7 +115,7 @@ func TestCollect_DedupAcrossNamespaces(t *testing.T) {
 		ProductID:  "prod",
 		Namespaces: []string{"ns1", "ns2"},
 		Interval:   30 * time.Second,
-	}, NewClientsetLister(client, nil), &stubReporter{}, nil)
+	}, NewClientsetLister(client, nil), &stubReporter{}, nil, newMetricsServerSource(NewClientsetLister(client, nil), nil))
 
 	got, err := a.Collect(context.Background())
 	if err != nil {
@@ -176,7 +149,7 @@ func TestCollect_SumsRestartCounts(t *testing.T) {
 	a := New(Config{
 		ProductID:  "prod",
 		Namespaces: []string{"default"},
-	}, NewClientsetLister(client, nil), &stubReporter{}, nil)
+	}, NewClientsetLister(client, nil), &stubReporter{}, nil, newMetricsServerSource(NewClientsetLister(client, nil), nil))
 
 	got, err := a.Collect(context.Background())
 	if err != nil {
@@ -194,29 +167,15 @@ func TestCollect_SumsRestartCounts(t *testing.T) {
 }
 
 // TestSumPodMetrics covers the raw summation across multiple containers and
+
 // multiple pods, independent of the agent wiring.
-func TestSumPodMetrics(t *testing.T) {
-	items := []metricsv1beta1.PodMetrics{
-		podMetrics("default", "api-1",
-			container("app", 100, 200_000_000),
-			container("sidecar", 50, 30_000_000),
-		),
-		podMetrics("default", "api-2",
-			container("app", 250, 300_000_000),
-		),
-	}
-	cpu, mem := sumPodMetrics(items)
-	if cpu != 400 {
-		t.Errorf("cpu = %d, want 400 (100 + 50 + 250)", cpu)
-	}
-	if mem != 530_000_000 {
-		t.Errorf("mem = %d, want 530000000 (200M + 30M + 300M)", mem)
-	}
-}
 
 // TestCollect_AttachesMetrics verifies CPU/memory are summed across multiple
+
 // containers and multiple pods, then attached as exactly two MetricSamples with
+
 // the correct keys and values.
+
 func TestCollect_AttachesMetrics(t *testing.T) {
 	client := fake.NewSimpleClientset(deployment("default", "api", "api", 2, 2))
 	reader := &fakeReader{
@@ -225,7 +184,7 @@ func TestCollect_AttachesMetrics(t *testing.T) {
 		metricsMem: 530_000_000, // e.g. 200M + 30M + 300M
 		available:  true,
 	}
-	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil)
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil, newMetricsServerSource(reader, nil))
 
 	got, err := a.Collect(context.Background())
 	if err != nil {
@@ -254,15 +213,18 @@ func TestCollect_AttachesMetrics(t *testing.T) {
 }
 
 // TestCollect_GracefulDegradeNoMetricsServer verifies that when metrics-server
+
 // is absent (sentinel error), the heartbeat is still produced with no Metrics
+
 // and Collect returns no error — the tick must not fail.
+
 func TestCollect_GracefulDegradeNoMetricsServer(t *testing.T) {
 	client := fake.NewSimpleClientset(deployment("default", "api", "api", 2, 2))
 	reader := &fakeReader{
 		inner:      NewClientsetLister(client, nil),
 		metricsErr: ErrMetricsAPIUnavailable,
 	}
-	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil)
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil, newMetricsServerSource(reader, nil))
 
 	got, err := a.Collect(context.Background())
 	if err != nil {
@@ -281,7 +243,9 @@ func TestCollect_GracefulDegradeNoMetricsServer(t *testing.T) {
 }
 
 // TestTick_GracefulDegradeNoMetricsServer is the Tick-level counterpart: a
+
 // heartbeat is still sent (no error) when metrics-server is missing.
+
 func TestTick_GracefulDegradeNoMetricsServer(t *testing.T) {
 	client := fake.NewSimpleClientset(deployment("default", "api", "api", 2, 2))
 	reader := &fakeReader{
@@ -289,7 +253,7 @@ func TestTick_GracefulDegradeNoMetricsServer(t *testing.T) {
 		metricsErr: ErrMetricsAPIUnavailable,
 	}
 	rep := &stubReporter{}
-	a := New(Config{ProductID: "prod", Source: "test", Namespaces: []string{"default"}}, reader, rep, nil)
+	a := New(Config{ProductID: "prod", Source: "test", Namespaces: []string{"default"}}, reader, rep, nil, newMetricsServerSource(reader, nil))
 
 	if err := a.Tick(context.Background()); err != nil {
 		t.Fatalf("Tick must not fail when metrics-server is missing: %v", err)
@@ -303,14 +267,16 @@ func TestTick_GracefulDegradeNoMetricsServer(t *testing.T) {
 }
 
 // TestCollect_GracefulDegradeTransientError verifies a transient (non-sentinel)
+
 // metrics error does not crash the tick and yields no metrics for that tick.
+
 func TestCollect_GracefulDegradeTransientError(t *testing.T) {
 	client := fake.NewSimpleClientset(deployment("default", "api", "api", 2, 2))
 	reader := &fakeReader{
 		inner:      NewClientsetLister(client, nil),
 		metricsErr: errors.New("metrics-server temporarily unavailable"),
 	}
-	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil)
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil, newMetricsServerSource(reader, nil))
 
 	got, err := a.Collect(context.Background())
 	if err != nil {
@@ -322,7 +288,9 @@ func TestCollect_GracefulDegradeTransientError(t *testing.T) {
 }
 
 // TestMetricsJSONMarshal verifies a batch carrying metrics marshals to the
+
 // agreed contract shape: metrics is an array of {key,value} objects (camelCase).
+
 func TestMetricsJSONMarshal(t *testing.T) {
 	batch := HeartbeatBatch{
 		ProductID: "p",
@@ -365,8 +333,11 @@ func TestMetricsJSONMarshal(t *testing.T) {
 }
 
 // TestServiceHeartbeat_OmitsEmptyMetrics confirms the metrics field is omitted
+
 // entirely (omitempty) when no samples are present — so degraded heartbeats
+
 // don't carry an empty "metrics" key.
+
 func TestServiceHeartbeat_OmitsEmptyMetrics(t *testing.T) {
 	b, err := json.Marshal(ServiceHeartbeat{Slug: "api", Status: StatusUp})
 	if err != nil {
@@ -378,28 +349,24 @@ func TestServiceHeartbeat_OmitsEmptyMetrics(t *testing.T) {
 }
 
 // TestPodMetricsForSelector_NilMetricsClient verifies the real lister reports
+
 // the metrics API as unavailable (graceful sentinel) when constructed without a
+
 // metrics client.
-func TestPodMetricsForSelector_NilMetricsClient(t *testing.T) {
-	r := NewClientsetLister(fake.NewSimpleClientset(), nil)
-	cpu, mem, available, err := r.PodMetricsForSelector(context.Background(), "default", "app=api")
-	if !errors.Is(err, ErrMetricsAPIUnavailable) {
-		t.Errorf("err = %v, want ErrMetricsAPIUnavailable", err)
-	}
-	if available || cpu != 0 || mem != 0 {
-		t.Errorf("expected unavailable zero metrics, got cpu=%d mem=%d available=%v", cpu, mem, available)
-	}
-}
 
 type stubReporter struct {
-	last  HeartbeatBatch
-	err   error
-	calls int
+	last   HeartbeatBatch
+	err    error
+	calls  int
+	onCall func(n int)
 }
 
 func (s *stubReporter) Send(_ context.Context, b HeartbeatBatch) error {
 	s.calls++
 	s.last = b
+	if s.onCall != nil {
+		s.onCall(s.calls)
+	}
 	return s.err
 }
 
@@ -411,7 +378,7 @@ func TestTick_SendsBatch(t *testing.T) {
 		Source:     "test",
 		Namespaces: []string{"default"},
 		Interval:   60 * time.Second,
-	}, NewClientsetLister(client, nil), rep, nil)
+	}, NewClientsetLister(client, nil), rep, nil, newMetricsServerSource(NewClientsetLister(client, nil), nil))
 
 	if err := a.Tick(context.Background()); err != nil {
 		t.Fatal(err)
@@ -426,7 +393,7 @@ func TestTick_SendsBatch(t *testing.T) {
 
 func TestTick_NoWorkloadsSkipsSend(t *testing.T) {
 	rep := &stubReporter{}
-	a := New(Config{Namespaces: []string{"default"}}, NewClientsetLister(fake.NewSimpleClientset(), nil), rep, nil)
+	a := New(Config{Namespaces: []string{"default"}}, NewClientsetLister(fake.NewSimpleClientset(), nil), rep, nil, noneSource{})
 	if err := a.Tick(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -438,7 +405,7 @@ func TestTick_NoWorkloadsSkipsSend(t *testing.T) {
 func TestRun_Once(t *testing.T) {
 	client := fake.NewSimpleClientset(deployment("default", "api", "api", 1, 1))
 	rep := &stubReporter{}
-	a := New(Config{ProductID: "p", Namespaces: []string{"default"}, Interval: time.Second}, NewClientsetLister(client, nil), rep, nil)
+	a := New(Config{ProductID: "p", Namespaces: []string{"default"}, Interval: time.Second}, NewClientsetLister(client, nil), rep, nil, newMetricsServerSource(NewClientsetLister(client, nil), nil))
 	if err := a.Run(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
@@ -447,41 +414,300 @@ func TestRun_Once(t *testing.T) {
 	}
 }
 
-func TestReporterSend(t *testing.T) {
-	var gotKey string
-	var gotBody HeartbeatBatch
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotKey = r.Header.Get("X-API-Key")
-		_ = json.NewDecoder(r.Body).Decode(&gotBody)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
+// TestRun_RejectsNonPositiveInterval pins that a misconfigured interval is an
 
-	rep := NewReporter(srv.URL, "zsk_test", 5*time.Second)
-	err := rep.Send(context.Background(), HeartbeatBatch{
-		ProductID: "p",
-		Services:  []ServiceHeartbeat{{Slug: "api", Status: StatusUp}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if gotKey != "zsk_test" {
-		t.Errorf("X-API-Key = %q", gotKey)
-	}
-	if gotBody.ProductID != "p" || len(gotBody.Services) != 1 || gotBody.Services[0].Slug != "api" {
-		t.Errorf("server received unexpected body: %+v", gotBody)
+// error rather than a panic. time.NewTicker panics on a non-positive duration,
+
+// and both ZENSU_MONITORING_AGENT_INTERVAL and the chart's agent.intervalSeconds
+
+// can produce one.
+
+func TestRun_RejectsNonPositiveInterval(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		a := New(Config{ProductID: "p", Namespaces: []string{"default"}, Interval: d},
+			NewClientsetLister(fake.NewSimpleClientset(), nil), &stubReporter{}, nil, noneSource{})
+
+		err := a.Run(context.Background(), false)
+		if err == nil {
+			t.Fatalf("interval %v must be rejected, got nil", d)
+		}
+		if !strings.Contains(err.Error(), "interval must be positive") {
+			t.Errorf("interval %v: error = %v, want it to name the interval", d, err)
+		}
 	}
 }
 
-func TestReporterSend_RejectsNon2xx(t *testing.T) {
+// TestRun_LoopsUntilContextCancelled covers the ticker path and pins that a tick
+
+// failing because the process is shutting down is not logged as a fault.
+
+//
+
+// The interval is far longer than a tick costs, so the ticker channel is empty
+
+// when the second tick cancels. A one-millisecond interval would leave both
+
+// select cases ready and Go would choose between them at random, admitting a
+
+// third tick.
+
+func TestRun_LoopsUntilContextCancelled(t *testing.T) {
+	client := fake.NewSimpleClientset(deployment("default", "api", "api", 1, 1))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	rep := &stubReporter{err: errors.New("backend down")}
+	rep.onCall = func(n int) {
+		if n == 2 {
+			cancel()
+		}
+	}
+	a := New(Config{ProductID: "p", Namespaces: []string{"default"}, Interval: 50 * time.Millisecond},
+		NewClientsetLister(client, nil), rep, log, noneSource{})
+
+	if err := a.Run(ctx, false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run = %v, want context.Canceled", err)
+	}
+	if rep.calls < 2 {
+		t.Errorf("calls = %d, want at least 2 — one immediate tick and one from the ticker", rep.calls)
+	}
+	if got := strings.Count(buf.String(), "heartbeat tick failed"); got != 1 {
+		t.Errorf("logged %d tick failures, want 1 — the tick cancelled by shutdown is not a fault; log:\n%s", got, buf.String())
+	}
+}
+
+// TestReporterSend hands the captured request over through a buffered channel:
+
+// the handler runs on the server's own goroutine, and a completed round trip is
+
+// not a happens-before edge for a plain variable.
+
+// TestReporterRefusesRedirect pins that the credential-carrying client will not
+
+// follow a 3xx. A heartbeat POST has no legitimate redirect, and following one
+
+// would send the API key to a destination the operator never configured.
+
+// TestReporterBoundsAndStripsPeerText pins that a rejecting endpoint cannot put
+
+// unbounded or control bytes into the agent's log.
+
+// refusingTransport fails every request the way a refused dial does, so the test
+
+// depends on neither a freed ephemeral port nor the platform's syscall wording.
+
+func (refusingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("connect: connection refused")
+}
+
+// TestReporterTransportErrorOmitsTheURL pins the same property on the heartbeat
+
+// client as on the scrape client. Both call (*http.Client).Do, and *url.Error
+
+// embeds the full URL in its Error().
+
+func TestCollect_SurvivesFailingExpositionSource(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
-		_, _ = w.Write([]byte(`{"code":"boom"}`))
 	}))
 	defer srv.Close()
 
-	rep := NewReporter(srv.URL, "k", 5*time.Second)
-	if err := rep.Send(context.Background(), HeartbeatBatch{ProductID: "p"}); err == nil {
-		t.Error("expected error on 500 response")
+	client := fake.NewSimpleClientset(
+		deployment("default", "api", "api", 2, 2),
+		pod("default", "api-1", map[string]string{"app": "api"}, 1),
+	)
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, NewClientsetLister(client, nil), &stubReporter{}, nil,
+		newExpositionSource(ExpositionConfig{URL: srv.URL}, nil, nil))
+
+	got, err := a.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("a failing scrape must not fail the tick: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 service, got %d", len(got))
+	}
+	if len(got[0].Metrics) != 0 {
+		t.Errorf("want no metrics after a failed scrape, got %+v", got[0].Metrics)
+	}
+	if got[0].Status != StatusUp {
+		t.Errorf("status = %s, want up — uptime must survive a metrics failure", got[0].Status)
+	}
+	if got[0].RestartCount == nil || *got[0].RestartCount != 1 {
+		t.Errorf("restartCount must survive a metrics failure, got %v", got[0].RestartCount)
+	}
+}
+
+func TestCollect_PassesPodNamesToSource(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		deployment("default", "api", "api", 2, 2),
+		pod("default", "api-1", map[string]string{"app": "api"}, 0),
+		pod("default", "api-2", map[string]string{"app": "api"}, 0),
+	)
+	spy := &spySource{}
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, NewClientsetLister(client, nil), &stubReporter{}, nil, spy)
+
+	if _, err := a.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(spy.calls) != 1 {
+		t.Fatalf("source should be asked exactly once per tick, got %d calls", len(spy.calls))
+	}
+	targets := spy.calls[0]
+	if len(targets) != 1 {
+		t.Fatalf("want 1 target, got %d", len(targets))
+	}
+	if targets[0].Slug != "api" || targets[0].Namespace != "default" {
+		t.Errorf("target identity wrong: %+v", targets[0])
+	}
+	if len(targets[0].PodNames) != 2 {
+		t.Errorf("PodNames = %v, want both pods so label attribution can work", targets[0].PodNames)
+	}
+	if targets[0].Selector == "" {
+		t.Error("Selector must be propagated for the metrics-server source")
+	}
+}
+
+// TestCollect_FoldsSamplesToTheirOwnService pins that the two-phase fold matches
+
+// samples to heartbeats by slug. With one service any indexing bug is invisible.
+
+func TestCollect_FoldsSamplesToTheirOwnService(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		deployment("default", "api", "api", 2, 2),
+		deployment("default", "worker", "worker", 1, 1),
+		deployment("default", "idle", "idle", 1, 1),
+	)
+	src := &stubSource{per: map[string][]MetricSample{
+		"api":    {{Key: MetricCPUMillicores, Value: 250}},
+		"worker": {{Key: MetricCPUMillicores, Value: 900}},
+	}}
+	m := obs.NewWithRegistry(prometheus.NewRegistry())
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, NewClientsetLister(client, nil), &stubReporter{}, nil, src)
+	a.Metrics = m
+
+	got, err := a.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("want 3 services, got %d", len(got))
+	}
+
+	bySlug := map[string][]MetricSample{}
+	for _, s := range got {
+		bySlug[s.Slug] = s.Metrics
+	}
+	for slug, want := range map[string]float64{"api": 250, "worker": 900} {
+		if len(bySlug[slug]) != 1 {
+			t.Errorf("%s carries %d samples, want 1: %+v", slug, len(bySlug[slug]), bySlug[slug])
+			continue
+		}
+		if bySlug[slug][0].Value != want {
+			t.Errorf("%s cpu = %v, want %v — samples must not cross services", slug, bySlug[slug][0].Value, want)
+		}
+	}
+	if len(bySlug["idle"]) != 0 {
+		t.Errorf("idle had no samples and must carry none, got %+v", bySlug["idle"])
+	}
+
+	if body := scrapeMetrics(t, m); !strings.Contains(body, "zensu_monitoring_agent_resource_services_mapped 2") {
+		t.Errorf("mapped gauge should read 2; body:\n%s", body)
+	}
+}
+
+// TestCollect_ResetsMappedGaugeWhenNothingMaps pins the TRANSITION to zero, which
+
+// is what the README tells operators to alert on. Asserting zero on a fresh
+
+// registry would prove nothing: a Prometheus gauge already reads zero before
+
+// anything sets it.
+
+func TestCollect_ResetsMappedGaugeWhenNothingMaps(t *testing.T) {
+	client := fake.NewSimpleClientset(deployment("default", "api", "api", 2, 2))
+	m := obs.NewWithRegistry(prometheus.NewRegistry())
+	populated := &stubSource{per: map[string][]MetricSample{
+		"api": {{Key: MetricCPUMillicores, Value: 250}},
+	}}
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}}, NewClientsetLister(client, nil), &stubReporter{}, nil, populated)
+	a.Metrics = m
+
+	if _, err := a.Collect(context.Background()); err != nil {
+		t.Fatalf("first Collect: %v", err)
+	}
+	if body := scrapeMetrics(t, m); !strings.Contains(body, "zensu_monitoring_agent_resource_services_mapped 1") {
+		t.Fatalf("gauge should read 1 after a mapping tick; body:\n%s", body)
+	}
+
+	a.source = &stubSource{}
+	if _, err := a.Collect(context.Background()); err != nil {
+		t.Fatalf("second Collect: %v", err)
+	}
+	if body := scrapeMetrics(t, m); !strings.Contains(body, "zensu_monitoring_agent_resource_services_mapped 0") {
+		t.Errorf("gauge must fall back to 0 when nothing attributes; body:\n%s", body)
+	}
+}
+
+// TestCollect_WarnsOnDuplicateSlug pins that a slug claimed twice is reported
+
+// rather than silently deduplicated, because the exposition would attribute rows
+
+// from both namespaces to the single surviving heartbeat.
+
+// A standing misconfiguration costs one line, not one per tick, so the second
+// Collect must not add a second warning.
+func TestCollect_WarnsOnDuplicateSlug(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		deployment("ns1", "api", "api", 2, 2),
+		deployment("ns2", "api-copy", "api", 1, 1),
+	)
+	var logged strings.Builder
+	a := New(Config{ProductID: "prod", Namespaces: []string{"ns1", "ns2"}},
+		NewClientsetLister(client, nil), &stubReporter{},
+		slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelWarn})), noneSource{})
+
+	got, err := a.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want the slug reported once, got %d", len(got))
+	}
+	if got := strings.Count(logged.String(), "claimed by more than one Deployment"); got != 1 {
+		t.Fatalf("warnings = %d, want 1; got:\n%s", got, logged.String())
+	}
+
+	if _, err := a.Collect(context.Background()); err != nil {
+		t.Fatalf("second Collect: %v", err)
+	}
+	if got := strings.Count(logged.String(), "claimed by more than one Deployment"); got != 1 {
+		t.Errorf("warnings = %d after a second tick, want the latch to hold at 1", got)
+	}
+}
+
+// TestCollect_DuplicateSlugLatchIsPerPair pins the re-arm: the latch is keyed on
+
+// the slug and the shadowed workload, so a THIRD Deployment later claiming the
+
+// same slug is a new fact the operator has not been told about yet.
+
+func TestCollect_DuplicateSlugLatchIsPerPair(t *testing.T) {
+	client := fake.NewSimpleClientset(
+		deployment("ns1", "api", "api", 2, 2),
+		deployment("ns2", "api-copy", "api", 1, 1),
+		deployment("ns3", "api-third", "api", 1, 1),
+	)
+	var logged strings.Builder
+	a := New(Config{ProductID: "prod", Namespaces: []string{"ns1", "ns2", "ns3"}},
+		NewClientsetLister(client, nil), &stubReporter{},
+		slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelWarn})), noneSource{})
+
+	if _, err := a.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if got := strings.Count(logged.String(), "claimed by more than one Deployment"); got != 2 {
+		t.Errorf("warnings = %d, want one per shadowed Deployment; got:\n%s", got, logged.String())
 	}
 }

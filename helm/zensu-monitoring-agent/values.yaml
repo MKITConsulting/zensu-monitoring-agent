@@ -24,7 +24,53 @@ agent:
   namespaces: []
   # cronjob mode only
   schedule: "*/1 * * * *"
+  # Soft heap ceiling handed to the Go runtime as GOMEMLIMIT, so it collects
+  # under pressure instead of being OOM-killed. Keep it below
+  # resources.limits.memory: the difference is headroom for memory the runtime
+  # does not account for. Raise both together, never one alone. Empty disables
+  # the setting, which leaves the runtime unbounded within the cgroup.
+  #
+  # The Go runtime parses this, NOT Kubernetes, so the suffixes are B, KiB, MiB,
+  # GiB and TiB — a Kubernetes quantity like "64Mi" copied from the limit below
+  # is rejected at process start. The chart refuses such a value rather than
+  # letting the pod crash-loop.
+  goMemLimit: "56MiB"
 
+# Where per-service CPU/memory come from. Uptime never depends on this.
+resourceMetrics:
+  # auto           = read metrics-server, fall through to scrapeUrl only if the
+  #                  cluster has no metrics.k8s.io API and a URL is set
+  # metrics-server = read metrics-server only
+  # exposition     = scrape scrapeUrl only (requires scrapeUrl)
+  # none           = no resource metrics at all
+  # Empty uses the built-in default, auto.
+  source: ""
+  # Prometheus exposition of an OpenTelemetry Collector (or anything serving the
+  # text format), e.g. http://otel-collector.observability:8889/metrics.
+  # This is an additional OUTBOUND destination for the agent.
+  scrapeUrl: ""
+  # Label on the scraped series whose value is the Zensu service slug. Project it
+  # in the collector with the k8sattributes processor from the zensu.dev/service
+  # annotation your Deployments already carry. Without it the agent falls back to
+  # matching pod/namespace labels against the pods it discovered.
+  # Empty uses the built-in default.
+  slugLabel: ""
+  # Override the auto-detected metric names. Leave empty unless your pipeline
+  # exposes neither the kubeletstats nor the cAdvisor names. CPU is expected in
+  # cores (or cumulative seconds), memory in bytes.
+  cpuMetric: ""
+  memoryMetric: ""
+  # Empty uses the built-in default.
+  scrapeTimeout: ""
+  # Cap on the exposition body, in bytes. Empty uses the built-in default of
+  # 8 MiB; values above 16 MiB fall back to it. The body is buffered whole and
+  # handed to the parser, so peak memory is this cap times the parser's expansion
+  # factor. Lowering it is always safe. RAISING it is only safe together with
+  # resources.limits.memory and agent.goMemLimit — raise all three, never one
+  # alone.
+  scrapeMaxBytes: ""
+
+# The agent's OWN Prometheus endpoint — unrelated to resourceMetrics above.
 metrics:
   enabled: true
   port: 2112
