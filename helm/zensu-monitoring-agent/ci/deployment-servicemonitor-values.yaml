@@ -1,0 +1,7 @@
+# expect: gomemlimit metrics-on servicemonitor
+agent:
+  mode: deployment
+metrics:
+  enabled: true
+  serviceMonitor:
+    enabled: true

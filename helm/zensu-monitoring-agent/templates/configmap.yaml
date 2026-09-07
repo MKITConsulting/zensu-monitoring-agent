@@ -10,3 +10,10 @@ data:
   ZENSU_MONITORING_AGENT_SOURCE: {{ .Values.zensu.source | quote }}
   ZENSU_MONITORING_AGENT_INTERVAL: {{ printf "%ds" (int .Values.agent.intervalSeconds) | quote }}
   ZENSU_MONITORING_AGENT_NAMESPACES: {{ include "zensu-monitoring-agent.namespaces" . | quote }}
+  ZENSU_MONITORING_AGENT_RESOURCE_SOURCE: {{ .Values.resourceMetrics.source | quote }}
+  ZENSU_MONITORING_AGENT_SCRAPE_URL: {{ .Values.resourceMetrics.scrapeUrl | quote }}
+  ZENSU_MONITORING_AGENT_SCRAPE_SLUG_LABEL: {{ .Values.resourceMetrics.slugLabel | quote }}
+  ZENSU_MONITORING_AGENT_SCRAPE_CPU_METRIC: {{ .Values.resourceMetrics.cpuMetric | quote }}
+  ZENSU_MONITORING_AGENT_SCRAPE_MEMORY_METRIC: {{ .Values.resourceMetrics.memoryMetric | quote }}
+  ZENSU_MONITORING_AGENT_SCRAPE_TIMEOUT: {{ .Values.resourceMetrics.scrapeTimeout | quote }}
+  ZENSU_MONITORING_AGENT_SCRAPE_MAX_BYTES: {{ include "zensu-monitoring-agent.scrapeMaxBytes" . | quote }}

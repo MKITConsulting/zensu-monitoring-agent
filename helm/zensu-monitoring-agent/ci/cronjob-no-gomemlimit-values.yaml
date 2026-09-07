@@ -1,0 +1,6 @@
+# expect: no-gomemlimit cronjob
+agent:
+  mode: cronjob
+  goMemLimit: ""
+metrics:
+  enabled: false

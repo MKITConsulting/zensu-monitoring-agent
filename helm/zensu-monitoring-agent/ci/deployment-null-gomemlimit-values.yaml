@@ -1,0 +1,6 @@
+# expect: no-gomemlimit metrics-on
+agent:
+  mode: deployment
+  goMemLimit: null
+metrics:
+  enabled: true

@@ -3,3 +3,8 @@
 *.out
 *.test
 .DS_Store
+
+# Zensu session state and cross-check traces are per-session runtime artefacts.
+# Plans and TDD run logs under .zensu/ ARE committable as an audit trail.
+/.zensu/state/
+/.zensu/logs/witness-*.log

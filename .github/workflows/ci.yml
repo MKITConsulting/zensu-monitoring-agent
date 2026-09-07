@@ -19,12 +19,166 @@ jobs:
 
   helm:
     runs-on: ubuntu-latest
+    env:
+      ZENSU_API_URL: https://api.zensu.dev
+      ZENSU_PRODUCT_ID: 00000000-0000-0000-0000-000000000000
+      ZENSU_API_KEY: zsk_test
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
       - run: helm lint helm/zensu-monitoring-agent
-      - run: |
-          helm template t helm/zensu-monitoring-agent \
-            --set zensu.apiUrl=https://api.zensu.dev \
-            --set zensu.productId=00000000-0000-0000-0000-000000000000 \
-            --set zensu.apiKey=zsk_test > /dev/null
+      - name: render every shape and assert what it contains
+        run: |
+          set -euo pipefail
+          req=(--set zensu.apiUrl="$ZENSU_API_URL"
+               --set zensu.productId="$ZENSU_PRODUCT_ID"
+               --set zensu.apiKey="$ZENSU_API_KEY")
+          # The expectation is DECLARED by each shape's "# expect:" marker rather
+          # than inferred from its values, so a shape cannot flip what it proves
+          # by accident. See helm/zensu-monitoring-agent/ci/README.md.
+          fail() { echo "$1" >&2; exit 1; }
+          for f in helm/zensu-monitoring-agent/ci/*-values.yaml; do
+            expect="$(sed -n '1s/^# expect: *//p' "$f")"
+            if [ -z "$expect" ]; then fail "$f: no '# expect:' marker"; fi
+            out="$(helm template t helm/zensu-monitoring-agent "${req[@]}" -f "$f")"
+            cm="$(awk '/^kind: ConfigMap$/{c=1} c{print} c&&/^---$/{exit}' <<<"$out")"
+
+            case " $expect " in
+              *" gomemlimit "*)
+                grep -q 'name: GOMEMLIMIT' <<<"$out" || fail "$f: GOMEMLIMIT missing" ;;
+              *" no-gomemlimit "*)
+                if grep -q 'name: GOMEMLIMIT' <<<"$out"; then fail "$f: GOMEMLIMIT emitted for an unset goMemLimit"; fi ;;
+              *) fail "$f: marker names neither gomemlimit nor no-gomemlimit" ;;
+            esac
+
+            case " $expect " in
+              *" metrics-on "*)
+                grep -q 'ZENSU_MONITORING_AGENT_METRICS_ENABLED' <<<"$out" || fail "$f: METRICS_ENABLED missing"
+                grep -A1 'name: ZENSU_MONITORING_AGENT_METRICS_ENABLED' <<<"$out" | grep -q 'value: "true"' || fail "$f: METRICS_ENABLED is not true"
+                grep -q 'containerPort:' <<<"$out" || fail "$f: the metrics containerPort is missing"
+                grep -q '^kind: Service$' <<<"$out" || fail "$f: the metrics Service is missing" ;;
+              *" metrics-off "*)
+                grep -A1 'name: ZENSU_MONITORING_AGENT_METRICS_ENABLED' <<<"$out" | grep -q 'value: "false"' || fail "$f: METRICS_ENABLED is not false"
+                if grep -q '^kind: Service$' <<<"$out"; then fail "$f: a Service rendered with metrics off"; fi ;;
+            esac
+
+            case " $expect " in
+              *" cronjob "*)
+                grep -q '^kind: CronJob$' <<<"$out" || fail "$f: no CronJob rendered"
+                grep -q -- '--once' <<<"$out" || fail "$f: the CronJob lost --once and would never terminate" ;;
+              *)
+                grep -q '^kind: Deployment$' <<<"$out" || fail "$f: no Deployment rendered" ;;
+            esac
+
+            case " $expect " in
+              *" networkpolicy "*)
+                grep -q '^kind: NetworkPolicy$' <<<"$out" || fail "$f: no NetworkPolicy rendered"
+                grep -A3 'from:' <<<"$out" | grep -q 'app: prometheus' || fail "$f: the policy has no from selector, i.e. it admits every source" ;;
+            esac
+
+            case " $expect " in
+              *" podannotations "*)
+                grep -q 'prometheus.io/scrape: "true"' <<<"$out" || fail "$f: the scrape annotation is missing"
+                grep -q 'prometheus.io/port:' <<<"$out" || fail "$f: the port annotation is missing"
+                grep -q 'prometheus.io/path: /metrics' <<<"$out" || fail "$f: the path annotation is missing" ;;
+              *)
+                if grep -q 'prometheus.io/scrape' <<<"$out"; then fail "$f: scrape annotations rendered without podAnnotations"; fi ;;
+            esac
+
+            case " $expect " in
+              *" servicemonitor "*)
+                grep -q '^kind: ServiceMonitor$' <<<"$out" || fail "$f: no ServiceMonitor rendered" ;;
+              *)
+                if grep -q '^kind: ServiceMonitor$' <<<"$out"; then fail "$f: a ServiceMonitor rendered without serviceMonitor.enabled"; fi ;;
+            esac
+
+            case " $expect " in
+              *" no-rbac "*)
+                if grep -qE '^kind: (Role|RoleBinding|ClusterRole|ClusterRoleBinding|ServiceAccount)$' <<<"$out"; then fail "$f: RBAC rendered with create=false"; fi
+                # The fallback is the branch with real cluster consequences.
+                grep -q 'serviceAccountName: default' <<<"$out" || fail "$f: the workload did not fall back to the default ServiceAccount" ;;
+              *)
+                grep -q '^kind: ServiceAccount$' <<<"$out" || fail "$f: no ServiceAccount rendered" ;;
+            esac
+
+            case " $expect " in
+              *" existing-secret "*)
+                if grep -q '^kind: Secret$' <<<"$out"; then fail "$f: the chart created a Secret although existingSecret was given"; fi
+                grep -q 'name: my-zensu-secret' <<<"$out" || fail "$f: the workload does not read the operator's Secret" ;;
+              *)
+                grep -q '^kind: Secret$' <<<"$out" || fail "$f: no Secret rendered" ;;
+            esac
+
+            grep -q 'envFrom:' <<<"$out" || fail "$f: the agent container lost its envFrom"
+
+            # The ConfigMap is the whole chart-to-binary contract for this
+            # feature, and the Go tests read os.Getenv rather than the chart, so
+            # a deleted, misspelled or misvalued key is invisible everywhere else.
+            # The key list is derived from the template that owns it.
+            keys="$(sed -n 's/^  \([A-Z][A-Z0-9_]*\):.*/\1/p' helm/zensu-monitoring-agent/templates/configmap.yaml)"
+            if [ -z "$keys" ]; then fail "could not read the ConfigMap key list from the template"; fi
+            for key in $keys; do
+              grep -q "^  $key:" <<<"$cm" || fail "$f: the ConfigMap lost $key"
+            done
+            grep -q "^  ZENSU_API_URL: \"$ZENSU_API_URL\"$" <<<"$cm" || fail "$f: ZENSU_API_URL did not render its value"
+            grep -q '^  ZENSU_MONITORING_AGENT_INTERVAL: "60s"$' <<<"$cm" || fail "$f: INTERVAL lost its duration suffix"
+
+            case " $expect " in
+              *" scrape-max-bytes "*)
+                # A values-file byte count is a float; rendered through %v it
+                # becomes 4.194304e+06, which the binary's ParseInt rejects and
+                # silently replaces with its own default.
+                grep -q '^  ZENSU_MONITORING_AGENT_SCRAPE_MAX_BYTES: "4194304"$' <<<"$cm" \
+                  || fail "$f: SCRAPE_MAX_BYTES did not render as a plain integer" ;;
+            esac
+
+            # The API key belongs in a Secret. Rendering it here would invert the
+            # split the chart is built on.
+            if grep -q "$ZENSU_API_KEY" <<<"$cm"; then fail "$f: the API key rendered into the ConfigMap"; fi
+          done
+      - name: values validation refuses every invalid shape
+        run: |
+          set -uo pipefail
+          req=(--set zensu.apiUrl="$ZENSU_API_URL"
+               --set zensu.productId="$ZENSU_PRODUCT_ID"
+               --set zensu.apiKey="$ZENSU_API_KEY")
+          refuse() {
+            local want="$1"; shift
+            local out rc
+            out="$(helm template t helm/zensu-monitoring-agent "${req[@]}" "$@" 2>&1)" && rc=0 || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              echo "expected a refusal for: $*" >&2
+              exit 1
+            fi
+            case "$out" in
+              *"$want"*) ;;
+              *) echo "refused for the wrong reason ($*): $out" >&2; exit 1 ;;
+            esac
+          }
+          # A bare 0 is the value Go template truthiness reads as empty; it is the
+          # regression this suite exists for, so it leads the list.
+          refuse "is not a Go memory limit" --set agent.goMemLimit=0
+          refuse "is not a Go memory limit" --set agent.goMemLimit=00
+          refuse "is not a Go memory limit" --set agent.goMemLimit=0MiB
+          refuse "is not a Go memory limit" --set agent.goMemLimit=-1MiB
+          refuse "is not a Go memory limit" --set agent.goMemLimit=64Mi
+          refuse "is not a Go memory limit" --set agent.goMemLimit=56M
+          refuse "is not a plain byte count" --set resourceMetrics.scrapeMaxBytes=8MiB
+          refuse "is neither deployment nor cronjob" --set agent.mode=Deployment
+          refuse "is neither deployment nor cronjob" --set agent.mode=daemonset
+          refuse "carries credentials in its userinfo" --set zensu.apiUrl=https://u:p@zensu.internal
+          refuse "needs an http:// or https:// scheme" --set zensu.apiUrl=zensu.internal
+          refuse "needs an http:// or https:// scheme" --set resourceMetrics.scrapeUrl=collector:8889/metrics
+          refuse "carries credentials in its userinfo" --set resourceMetrics.scrapeUrl=http://u:p@collector:8889/metrics
+          refuse "carries credentials in its userinfo" \
+            --set resourceMetrics.source=metrics-server \
+            --set resourceMetrics.scrapeUrl=http://u:p@collector:8889/metrics
+          refuse "must name the allowed sources" --set metrics.networkPolicy.enabled=true
+          refuse "needs metrics.enabled" \
+            --set metrics.networkPolicy.enabled=true \
+            --set 'metrics.networkPolicy.from[0].podSelector.matchLabels.app=p' \
+            --set metrics.enabled=false
+          refuse "needs agent.mode=deployment" \
+            --set metrics.networkPolicy.enabled=true \
+            --set 'metrics.networkPolicy.from[0].podSelector.matchLabels.app=p' \
+            --set agent.mode=cronjob

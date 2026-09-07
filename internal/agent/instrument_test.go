@@ -101,7 +101,7 @@ func TestTickSetsServicesReported(t *testing.T) {
 	reader := &fakeReader{inner: NewClientsetLister(client, nil), metricsErr: ErrMetricsAPIUnavailable}
 	m := obs.NewWithRegistry(prometheus.NewRegistry())
 
-	a := New(Config{ProductID: "prod", Source: "test", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil)
+	a := New(Config{ProductID: "prod", Source: "test", Namespaces: []string{"default"}}, reader, &stubReporter{}, nil, newMetricsServerSource(reader, nil))
 	a.Metrics = m
 
 	if err := a.Tick(context.Background()); err != nil {
