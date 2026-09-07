@@ -19,6 +19,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,14 +34,29 @@ import (
 // scraping a large cluster can expose tens of megabytes; the agent only needs a
 // handful of series and must not be pushed out of its container memory limit by
 // an endpoint it does not control.
+//
+// Measured against a realistic kubeletstats exposition at this cap: a 7.9 MiB
+// body allocates 70.3 MiB and settles at 59-69 MiB RSS under GOMEMLIMIT=56MiB,
+// which the chart's 64Mi container limit absorbs at 10-19 collections per
+// scrape.
 const DefaultMaxBytes int64 = 8 << 20
 
-// MaxConfigurableBytes is a sanity bound on operator input, not a container-safety
-// guarantee. It catches a typo, and math.MaxInt64, which would overflow the read
-// limit into a silent empty success; such a value falls back to DefaultMaxBytes.
-// It does NOT make every value below it safe to run: see MaxSamples for the peak
-// model. Raising the cap is only safe together with the container memory limit and
-// the runtime's soft ceiling.
+// ExpansionFactor is how much heap the parser allocates per byte of exposition,
+// measured rather than estimated: 9.27x at a 1 MiB cap, 9.25x at 2 MiB, 9.36x at
+// 4 MiB and 8.95x at 8 MiB, so 10 is the rounded-up bound a memory limit is
+// divided by. It is an ALLOCATION factor: the collector keeps live heap well
+// below it, so it bounds what an operator may configure and does not predict RSS.
+const ExpansionFactor int64 = 10
+
+// MaxConfigurableBytes is the absolute ceiling on operator input, applied when the
+// runtime carries no memory limit to derive one from. It catches a typo, and
+// math.MaxInt64, which would overflow the read limit into a silent empty success;
+// such a value falls back to DefaultMaxBytes.
+//
+// On its own it is not a container-safety guarantee: measured at this cap the agent
+// reaches 91.3 MiB RSS, past the chart's 64Mi limit. Where GOMEMLIMIT is set, the
+// real ceiling is derived from it instead, so a raised cap cannot outrun the memory
+// the pod was actually given.
 const MaxConfigurableBytes int64 = 16 << 20
 
 // MaxSamples caps how many Series one scrape may materialize, because a row
@@ -50,9 +66,9 @@ const MaxConfigurableBytes int64 = 16 << 20
 // It is NOT a peak-heap bound, and must not be read as one. expfmt hands back a
 // whole decoded family at a time, so that family's protobuf values exist before
 // this budget can refuse them; the budget bounds what the agent RETAINS, not
-// what the parser transiently builds. Peak is governed by the body cap times the
-// parser's expansion factor, and the deployment's GOMEMLIMIT gives the runtime a
-// soft ceiling below the container limit so it collects under pressure instead of
+// what the parser transiently builds. Peak is governed by the body cap times
+// ExpansionFactor, and the deployment's GOMEMLIMIT gives the runtime a soft
+// ceiling below the container limit so it collects under pressure instead of
 // being OOM-killed.
 const MaxSamples = 50_000
 
@@ -140,6 +156,9 @@ type Client struct {
 	URL      string
 	HTTP     *http.Client
 	MaxBytes int64
+	// MemLimit is the heap ceiling MaxBytes is bounded against. Zero asks the Go
+	// runtime for this process's own GOMEMLIMIT.
+	MemLimit int64
 }
 
 // noRedirect refuses to follow a redirect, surfacing it as a normal response
@@ -167,8 +186,11 @@ func NewClient(url string, timeout time.Duration) *Client {
 // finite scalar. Summary and histogram families are skipped rather than
 // erroring, so one unsupported family in a large exposition does not cost the
 // whole scrape. When keep is non-empty only families whose normalized name is in
-// it are materialized, which keeps an exposition the agent mostly discards from
-// allocating a label map per sample.
+// it become Series, which bounds what a scrape RETAINS: measured at 4352 series
+// kept where admitting every family retained 26844. It does not bound peak
+// allocation. expfmt parses the whole body on the first Decode, so discarding ten
+// of twelve families measured 0.87x — the filter is a retention bound, not a
+// memory defence.
 //
 // The decoder is pinned to the format the agent asked for rather than taken from
 // the response Content-Type: letting the peer choose would let it steer the agent
@@ -210,14 +232,40 @@ func (c *Client) Fetch(ctx context.Context, keep map[string]bool) ([]Series, err
 }
 
 // readLimit resolves the effective body cap. A non-positive value means unset,
-// and a value above MaxConfigurableBytes is refused rather than honoured — which
-// also keeps limit+1 in Fetch from overflowing at math.MaxInt64, where a negative
+// and a value above the ceiling is refused rather than honoured — which also
+// keeps limit+1 in Fetch from overflowing at math.MaxInt64, where a negative
 // limit would make io.LimitReader return an empty body and a silent success.
 func (c *Client) readLimit() int64 {
-	if c.MaxBytes <= 0 || c.MaxBytes > MaxConfigurableBytes {
+	if ceiling := c.ceiling(); c.MaxBytes <= 0 || c.MaxBytes > ceiling {
 		return DefaultMaxBytes
 	}
 	return c.MaxBytes
+}
+
+// EffectiveMaxBytes reports the cap this client will actually apply. It differs
+// from MaxBytes exactly when the configured value was refused, so a caller can
+// tell an operator their setting did not take effect instead of leaving them to
+// infer it from memory behaviour.
+func (c *Client) EffectiveMaxBytes() int64 { return c.readLimit() }
+
+// ceiling derives the largest cap this process can afford from its own heap
+// limit, so raising the cap without raising GOMEMLIMIT is refused rather than
+// merely discouraged. DefaultMaxBytes is the floor: it is the value measured
+// against the chart's own limits, and a derived ceiling below it would shrink the
+// shipped default on a deployment that never changed one.
+func (c *Client) ceiling() int64 {
+	limit := c.MemLimit
+	if limit <= 0 {
+		limit = debug.SetMemoryLimit(-1)
+	}
+	switch derived := limit / ExpansionFactor; {
+	case derived < DefaultMaxBytes:
+		return DefaultMaxBytes
+	case derived > MaxConfigurableBytes:
+		return MaxConfigurableBytes
+	default:
+		return derived
+	}
 }
 
 // decode reads every family the keep set admits, bounded by MaxSamples. A parse

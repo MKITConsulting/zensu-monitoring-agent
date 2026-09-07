@@ -63,11 +63,13 @@ resourceMetrics:
   # Empty uses the built-in default.
   scrapeTimeout: ""
   # Cap on the exposition body, in bytes. Empty uses the built-in default of
-  # 8 MiB; values above 16 MiB fall back to it. The body is buffered whole and
-  # handed to the parser, so peak memory is this cap times the parser's expansion
-  # factor. Lowering it is always safe. RAISING it is only safe together with
-  # resources.limits.memory and agent.goMemLimit — raise all three, never one
-  # alone.
+  # 8 MiB. The body is buffered whole and handed to the parser, so peak memory is
+  # this cap times a measured allocation factor of ~9.3x, not the cap itself.
+  # Lowering it is always safe. RAISING it is bounded by the memory the pod
+  # actually has: the agent honours at most agent.goMemLimit divided by 10,
+  # floored at 8 MiB and capped at 16 MiB, and falls back to 8 MiB for anything
+  # above that. So raise all three together — this value, agent.goMemLimit and
+  # resources.limits.memory — never one alone.
   scrapeMaxBytes: ""
 
 # The agent's OWN Prometheus endpoint — unrelated to resourceMetrics above.

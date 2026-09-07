@@ -73,6 +73,10 @@ func newExpositionSource(cfg ExpositionConfig, log *slog.Logger, metrics *obs.Me
 	client := scrape.NewClient(cfg.URL, cfg.Timeout)
 	if cfg.MaxBytes > 0 {
 		client.MaxBytes = cfg.MaxBytes
+		if effective := client.EffectiveMaxBytes(); effective != cfg.MaxBytes {
+			log.Warn("scrape body cap refused: it exceeds what this pod's heap limit affords, raise GOMEMLIMIT and resources.limits.memory with it",
+				"configured_bytes", cfg.MaxBytes, "effective_bytes", effective)
+		}
 	}
 	return &expositionSource{
 		client:    client,

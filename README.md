@@ -165,10 +165,14 @@ and `restartCount` still ship.
   to say which service each measurement belongs to, so a compromised or misconfigured
   collector can misattribute usage. One availability note: the agent buffers a body it
   does not control up to `scrapeMaxBytes` and hands it to the parser whole, so peak
-  memory is that cap times the parser's expansion factor rather than the cap itself; the
-  series ceiling bounds what is retained between scrapes, not that peak. `agent.goMemLimit`
-  keeps the runtime collecting under pressure; it, `resources.limits.memory` and
-  `resourceMetrics.scrapeMaxBytes` are raised together, never one alone.
+  memory is that cap times a measured allocation factor of ~9.3x rather than the cap
+  itself — 7.9 MiB of body allocates 70.3 MiB and settles at 59-69 MiB RSS under the
+  chart's `GOMEMLIMIT=56MiB` and `64Mi` limit. The series ceiling bounds what is retained
+  between scrapes, not that peak, and neither does the family filter. Because the factor
+  is measured, the agent derives the largest cap it will honour from `agent.goMemLimit`
+  (that limit divided by 10, floored at the 8 MiB default): raising
+  `resourceMetrics.scrapeMaxBytes` without also raising `agent.goMemLimit` and
+  `resources.limits.memory` is refused rather than merely discouraged.
 - **Hardened container.** Distroless `nonroot`, read-only root filesystem, all
   Linux capabilities dropped.
 - **Auditable.** A few hundred lines of Go. Read it.
@@ -209,7 +213,7 @@ metadata:
 | `ZENSU_MONITORING_AGENT_SCRAPE_CPU_METRIC` | no | — | Override the auto-detected CPU metric name |
 | `ZENSU_MONITORING_AGENT_SCRAPE_MEMORY_METRIC` | no | — | Override the auto-detected memory metric name |
 | `ZENSU_MONITORING_AGENT_SCRAPE_TIMEOUT` | no | `10s` | Per-scrape HTTP timeout (Go duration), covering the whole request |
-| `ZENSU_MONITORING_AGENT_SCRAPE_MAX_BYTES` | no | `8388608` (8 MiB) | Cap on the exposition body in bytes. Values above 16 MiB fall back to the default. A scrape carrying more than 50 000 series **of the families the agent matches** is refused regardless; families it does not match are dropped before they count. Raising this cap is only safe together with `resources.limits.memory` and `agent.goMemLimit`. |
+| `ZENSU_MONITORING_AGENT_SCRAPE_MAX_BYTES` | no | `8388608` (8 MiB) | Cap on the exposition body in bytes. The honoured ceiling is `GOMEMLIMIT / 10` (the measured allocation factor), floored at the 8 MiB default and capped at 16 MiB; a value above it falls back to the default. A scrape carrying more than 50 000 series **of the families the agent matches** is refused regardless; families it does not match are dropped before they count. Raising this cap is only safe together with `resources.limits.memory` and `agent.goMemLimit`. |
 
 `METRICS_*` configures the agent's **own** endpoint; `RESOURCE_SOURCE` / `SCRAPE_*`
 configure where it **reads** service CPU/memory. The two are unrelated.

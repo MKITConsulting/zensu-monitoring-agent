@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"testing"
@@ -875,6 +876,47 @@ func loggedSource(t *testing.T, url string, cfg ExpositionConfig) (*expositionSo
 	var buf strings.Builder
 	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	return newExpositionSource(cfg, log, nil), &buf
+}
+
+// TestExpositionSourceWarnsOnRefusedMaxBytes pins the diagnostic for the second
+// likely operator misconfiguration: raising the body cap without raising the
+// pod's heap limit. The cap is derived from GOMEMLIMIT, so the configured value
+// is silently refused unless it is reported.
+func TestExpositionSourceWarnsOnRefusedMaxBytes(t *testing.T) {
+	previous := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(previous) })
+	debug.SetMemoryLimit(56 << 20)
+
+	_, buf := loggedSource(t, "http://example.invalid/metrics", ExpositionConfig{MaxBytes: scrape.MaxConfigurableBytes})
+
+	logged := buf.String()
+	if !strings.Contains(logged, "scrape body cap refused") {
+		t.Errorf("a refused cap must be reported at construction; log:\n%s", logged)
+	}
+	if !strings.Contains(logged, "configured_bytes=16777216") {
+		t.Errorf("the warning must name the configured value; log:\n%s", logged)
+	}
+	if !strings.Contains(logged, "effective_bytes=8388608") {
+		t.Errorf("the warning must name the value actually applied; log:\n%s", logged)
+	}
+}
+
+// TestExpositionSourceAcceptsAffordableMaxBytes is the negative half: a cap the
+// heap limit can carry is applied without a warning, so the diagnostic above
+// cannot degrade into noise on a correctly sized deployment.
+func TestExpositionSourceAcceptsAffordableMaxBytes(t *testing.T) {
+	previous := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(previous) })
+	debug.SetMemoryLimit(160 << 20)
+
+	src, buf := loggedSource(t, "http://example.invalid/metrics", ExpositionConfig{MaxBytes: scrape.MaxConfigurableBytes})
+
+	if got := src.client.EffectiveMaxBytes(); got != scrape.MaxConfigurableBytes {
+		t.Errorf("EffectiveMaxBytes() = %d, want the configured %d", got, scrape.MaxConfigurableBytes)
+	}
+	if logged := buf.String(); logged != "" {
+		t.Errorf("an affordable cap must warn about nothing; log:\n%s", logged)
+	}
 }
 
 // TestExpositionSourceWarnsOnOverrideMismatch pins the diagnostic for the most

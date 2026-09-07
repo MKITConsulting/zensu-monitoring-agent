@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -523,10 +524,70 @@ func TestReadLimitResolution(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := (&Client{MaxBytes: c.in}).readLimit(); got != c.want {
+			client := &Client{MaxBytes: c.in, MemLimit: math.MaxInt64}
+			if got := client.readLimit(); got != c.want {
 				t.Errorf("readLimit(%d) = %d, want %d", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// TestCeilingDerivedFromMemLimit pins the rule that makes the documented "raise
+// all three together" enforceable instead of advisory: a cap the pod's own heap
+// limit cannot afford is refused, and the shipped default is never shrunk by a
+// derivation the operator did not ask for.
+func TestCeilingDerivedFromMemLimit(t *testing.T) {
+	const mib = 1 << 20
+	cases := []struct {
+		name     string
+		memLimit int64
+		want     int64
+	}{
+		{"no runtime limit keeps the absolute ceiling", math.MaxInt64, MaxConfigurableBytes},
+		{"the chart default cannot afford more than the default cap", 56 * mib, DefaultMaxBytes},
+		{"a limit below the default still floors at the default", 8 * mib, DefaultMaxBytes},
+		{"exactly ten times the default derives the default", DefaultMaxBytes * ExpansionFactor, DefaultMaxBytes},
+		{"a raised limit derives a proportionally raised ceiling", 120 * mib, 12 * mib},
+		{"a limit past the absolute ceiling is clamped", 1024 * mib, MaxConfigurableBytes},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := (&Client{MemLimit: c.memLimit}).ceiling(); got != c.want {
+				t.Errorf("ceiling() at memLimit %d = %d, want %d", c.memLimit, got, c.want)
+			}
+		})
+	}
+}
+
+// TestReadLimitRefusesCapTheMemLimitCannotAfford is the behavioural half: the
+// operator raised scrapeMaxBytes to the absolute ceiling but left GOMEMLIMIT at
+// the chart default, so the cap falls back rather than being honoured.
+func TestReadLimitRefusesCapTheMemLimitCannotAfford(t *testing.T) {
+	const mib = 1 << 20
+	client := &Client{MaxBytes: MaxConfigurableBytes, MemLimit: 56 * mib}
+	if got := client.readLimit(); got != DefaultMaxBytes {
+		t.Errorf("readLimit() = %d, want the default %d", got, DefaultMaxBytes)
+	}
+	client.MemLimit = 160 * mib
+	if got := client.readLimit(); got != MaxConfigurableBytes {
+		t.Errorf("readLimit() with headroom = %d, want %d", got, MaxConfigurableBytes)
+	}
+}
+
+// TestZeroMemLimitReadsTheRuntime pins that an unset MemLimit consults the
+// process's own GOMEMLIMIT rather than silently behaving as unbounded.
+func TestZeroMemLimitReadsTheRuntime(t *testing.T) {
+	previous := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(previous) })
+
+	debug.SetMemoryLimit(56 << 20)
+	if got := (&Client{}).ceiling(); got != DefaultMaxBytes {
+		t.Errorf("ceiling() under a 56MiB runtime limit = %d, want %d", got, DefaultMaxBytes)
+	}
+
+	debug.SetMemoryLimit(math.MaxInt64)
+	if got := (&Client{}).ceiling(); got != MaxConfigurableBytes {
+		t.Errorf("ceiling() under no runtime limit = %d, want %d", got, MaxConfigurableBytes)
 	}
 }
 
