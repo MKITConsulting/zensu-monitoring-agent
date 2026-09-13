@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
 	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
@@ -77,5 +79,37 @@ func TestPodMetricsForSelector_NilMetricsClient(t *testing.T) {
 	}
 	if available || cpu != 0 || mem != 0 {
 		t.Errorf("expected unavailable zero metrics, got cpu=%d mem=%d available=%v", cpu, mem, available)
+	}
+}
+
+// TestDeploymentSelectorHonoursMatchExpressions pins that a Deployment which
+// selects its pods only through MatchExpressions still yields a usable selector.
+// Reading MatchLabels alone rendered "" for it, and every caller reads "" as
+// "this workload selects nothing".
+func TestDeploymentSelectorHonoursMatchExpressions(t *testing.T) {
+	cases := []struct {
+		name     string
+		selector *metav1.LabelSelector
+		want     string
+	}{
+		{name: "no selector at all", selector: nil, want: ""},
+		{name: "present but empty selects everything, so callers must skip it",
+			selector: &metav1.LabelSelector{}, want: ""},
+		{name: "match labels", selector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{"app": "api"}}, want: "app=api"},
+		{name: "match expressions only", selector: &metav1.LabelSelector{
+			MatchExpressions: []metav1.LabelSelectorRequirement{{
+				Key:      "app",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{"api"},
+			}}}, want: "app in (api)"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			d := appsv1.Deployment{Spec: appsv1.DeploymentSpec{Selector: c.selector}}
+			if got := deploymentSelector(d); got != c.want {
+				t.Errorf("deploymentSelector() = %q, want %q", got, c.want)
+			}
+		})
 	}
 }

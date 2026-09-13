@@ -97,6 +97,13 @@ pod's own pod-level row, which would otherwise count the pod twice; cAdvisor's
 pod-level row keeps it. So a `zensu` CPU figure is deliberately not the same number
 as a bare `sum(container_cpu_usage_seconds_total)` over the same pods.
 
+One shape the agent cannot resolve: a pod-level row that carries no `namespace`
+label while the same metric carries namespaced container rows for that pod name.
+It is either that pod's total or a same-named pod's only row in another namespace,
+and nothing in the exposition says which. The agent drops it — over-reporting a
+service is the worse failure — and logs a warning naming the pod, so project the
+namespace label consistently in your collector if you see one.
+
 Set `resourceMetrics.cpuMetric` / `resourceMetrics.memoryMetric` only if your pipeline
 exposes none of these. An override is expected to report CPU in cores (or cumulative
 seconds) and memory in bytes.

@@ -3,8 +3,10 @@ package agent
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -24,7 +26,7 @@ func TestMetricsServerSourceReportsUnavailableAPI(t *testing.T) {
 	}
 }
 
-func TestAutoSourceFallsThroughOnceAndStays(t *testing.T) {
+func TestAutoSourceFallsThroughAndHoldsForTheCooldown(t *testing.T) {
 	srv := newExpositionServer(t, `# TYPE k8s_pod_cpu_usage gauge
 k8s_pod_cpu_usage{zensu_service="api"} 0.25
 `)
@@ -57,8 +59,85 @@ k8s_pod_cpu_usage{zensu_service="api"} 0.25
 		t.Fatalf("second Samples: %v", err)
 	}
 	if reader.metricsHits != hitsAfterSwitch {
-		t.Errorf("metrics-server was probed again after the switch (%d -> %d); the switch must be one-way",
+		t.Errorf("metrics-server was probed again inside the cooldown (%d -> %d); re-probing every tick is what the cooldown exists to prevent",
 			hitsAfterSwitch, reader.metricsHits)
+	}
+}
+
+// TestAutoSourceReturnsToPrimaryAfterCooldown pins the half that makes the
+// switch survivable: one transient NotFound during a metrics-server rollout
+// must not strand the agent on the exposition for the process lifetime.
+func TestAutoSourceReturnsToPrimaryAfterCooldown(t *testing.T) {
+	srv := newExpositionServer(t, `# TYPE k8s_pod_cpu_usage gauge
+k8s_pod_cpu_usage{zensu_service="api"} 0.25
+`)
+	reader := &fakeReader{
+		inner:      NewClientsetLister(fake.NewSimpleClientset(), nil),
+		metricsErr: ErrMetricsAPIUnavailable,
+	}
+	now := time.Now()
+	src := &autoSource{
+		primary:  newMetricsServerSource(reader, slog.Default()),
+		fallback: newExpositionSource(ExpositionConfig{URL: srv.URL}, slog.Default(), nil),
+		log:      slog.Default(),
+		now:      func() time.Time { return now },
+	}
+	targets := []ServiceTarget{{Slug: "api", Namespace: "default", Selector: "app=api"}}
+
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("first Samples: %v", err)
+	}
+	if src.Name() != SourceExposition {
+		t.Fatalf("Name() = %q, want the fallback after the switch", src.Name())
+	}
+
+	reader.metricsErr = nil
+	reader.metricsCPU = 400
+	reader.metricsMem = 530_000_000
+	reader.available = true
+
+	now = now.Add(autoRetryInterval - time.Second)
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("Samples inside the cooldown: %v", err)
+	}
+	if src.Name() != SourceExposition {
+		t.Errorf("Name() = %q, want the fallback still — the cooldown has not elapsed", src.Name())
+	}
+
+	now = now.Add(2 * time.Second)
+	got, err := src.Samples(context.Background(), targets)
+	if err != nil {
+		t.Fatalf("Samples after the cooldown: %v", err)
+	}
+	if v := samplesByKey(t, got, "api")[MetricCPUMillicores]; v != 400 {
+		t.Errorf("cpu = %v, want 400 from metrics-server once it answers again", v)
+	}
+	if src.Name() != SourceMetricsServer {
+		t.Errorf("Name() = %q, want %q after recovery", src.Name(), SourceMetricsServer)
+	}
+}
+
+// TestMetricsServerSourceSkipsSelectorlessTarget pins that a target carrying no
+// selector is skipped rather than passed on: an empty selector matches every pod
+// in the namespace, so the service would report the whole namespace's usage.
+func TestMetricsServerSourceSkipsSelectorlessTarget(t *testing.T) {
+	reader := &fakeReader{
+		inner:      NewClientsetLister(fake.NewSimpleClientset(), nil),
+		metricsCPU: 400,
+		metricsMem: 530_000_000,
+		available:  true,
+	}
+	src := newMetricsServerSource(reader, slog.Default())
+
+	got, err := src.Samples(context.Background(), []ServiceTarget{{Slug: "api", Namespace: "default"}})
+	if err != nil {
+		t.Fatalf("Samples: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %+v, want nothing — an empty selector must never be queried", got)
+	}
+	if reader.metricsHits != 0 {
+		t.Errorf("metricsHits = %d, want 0 — the cluster must not be asked at all", reader.metricsHits)
 	}
 }
 
@@ -107,6 +186,7 @@ func TestValidateAPIURL(t *testing.T) {
 		{name: "bare username", raw: "https://u@zensu.internal", wantErrContains: "carries credentials"},
 		{name: "no scheme", raw: "zensu.internal", wantErrContains: "http:// or https:// scheme"},
 		{name: "no host", raw: "https:///base", wantErrContains: "needs a host"},
+		{name: "port but no host", raw: "http://:8080/metrics", wantErrContains: "needs a host"},
 		{name: "unparsable", raw: "http://[::1", wantErrContains: "not a valid URL"},
 	}
 	for _, c := range cases {

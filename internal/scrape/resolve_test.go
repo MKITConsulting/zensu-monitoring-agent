@@ -205,7 +205,7 @@ func TestSelectionRollupIsPerPod(t *testing.T) {
 	rollupOfA := gauge("m", map[string]string{"namespace": "prod", "pod": "a"}, 2)
 	podOnlyB := gauge("m", map[string]string{"namespace": "prod", "pod": "b"}, 3)
 
-	kept, excluded := summable([]Series{withContainers, rollupOfA, podOnlyB})
+	kept, excluded, _ := summable([]Series{withContainers, rollupOfA, podOnlyB})
 	if excluded != 1 {
 		t.Errorf("excluded = %d, want 1", excluded)
 	}
@@ -230,18 +230,27 @@ func TestSelectionRollupIsPerPod(t *testing.T) {
 	}
 }
 
-// TestSelectionRollupIgnoresUnidentifiedPods pins that a row which does not name
-// both a namespace and a pod cannot join another pod's rollup set. Grouping on a
-// bare pod name would let one namespace's containers delete another namespace's
-// only row.
-func TestSelectionRollupIgnoresUnidentifiedPods(t *testing.T) {
-	kept, _ := summable([]Series{
+// TestSelectionRollupReportsUnidentifiedPods pins the resolution of the one case
+// no rule can decide: a total naming only a pod, next to namespaced container
+// rows for that same pod name. It is either that pod's total (summing it doubles
+// the pod) or a same-named pod's only row in another namespace (dropping it
+// loses that pod). The row is dropped, because over-reporting a customer's usage
+// is the worse failure, and it is NAMED so the relabel rule behind it can be
+// fixed instead of the loss being silent.
+func TestSelectionRollupReportsUnidentifiedPods(t *testing.T) {
+	kept, _, ambiguous := summable([]Series{
 		gauge("m", map[string]string{"namespace": "prod", "pod": "web-0", "container": "app"}, 1),
 		gauge("m", map[string]string{"pod": "web-0"}, 5),
 	})
 
-	if got := len(kept); got != 2 {
-		t.Errorf("kept %d rows, want 2 — a row without a namespace must not be treated as another namespace's rollup", got)
+	if got := len(kept); got != 1 {
+		t.Errorf("kept %d rows, want only the container row — the namespace-less total cannot be attributed", got)
+	}
+	if len(kept) == 1 && kept[0].Value != 1 {
+		t.Errorf("kept the wrong row: %+v", kept[0])
+	}
+	if len(ambiguous) != 1 || ambiguous[0] != "web-0" {
+		t.Errorf("ambiguous = %v, want the dropped pod named so the diagnostic can report it", ambiguous)
 	}
 }
 
@@ -252,12 +261,15 @@ func TestSelectionRollupIgnoresUnidentifiedPods(t *testing.T) {
 func TestSelectionRollupAcceptsBothContainerSpellings(t *testing.T) {
 	for _, label := range []string{"container", "k8s_container_name"} {
 		t.Run(label, func(t *testing.T) {
-			kept, _ := summable([]Series{
+			kept, _, ambiguous := summable([]Series{
 				gauge("m", map[string]string{"namespace": "prod", "pod": "a", label: "app"}, 1),
 				gauge("m", map[string]string{"namespace": "prod", "pod": "a"}, 9),
 			})
 			if len(kept) != 1 || kept[0].Value != 1 {
 				t.Errorf("kept %+v, want only the per-container row", kept)
+			}
+			if len(ambiguous) != 0 {
+				t.Errorf("ambiguous = %v, want none — both rows name their namespace", ambiguous)
 			}
 		})
 	}
@@ -268,7 +280,7 @@ func TestSelectionRollupAcceptsBothContainerSpellings(t *testing.T) {
 // would add its usage to every pod on the cAdvisor path, and would also mark the
 // pod's genuine rollup row as superseded when no real container row exists.
 func TestSummableDropsThePauseContainer(t *testing.T) {
-	kept, excluded := summable([]Series{
+	kept, excluded, _ := summable([]Series{
 		gauge("m", map[string]string{"namespace": "prod", "pod": "a", "container": "POD"}, 7),
 		gauge("m", map[string]string{"namespace": "prod", "pod": "a", "container": "app"}, 1),
 		gauge("m", map[string]string{"namespace": "prod", "pod": "b", "container": "POD"}, 7),
@@ -297,7 +309,7 @@ func TestSummableDropsThePauseContainer(t *testing.T) {
 // that fallback, so an exposition in that shape must still have its pod-level
 // rollup removed — otherwise every pod carrying both shapes ships at double.
 func TestSummableDeduplicatesNamespacelessRows(t *testing.T) {
-	kept, excluded := summable([]Series{
+	kept, excluded, _ := summable([]Series{
 		gauge("m", map[string]string{"pod": "api-1", "container": "app"}, 10),
 		gauge("m", map[string]string{"pod": "api-1"}, 10),
 	})
@@ -310,11 +322,12 @@ func TestSummableDeduplicatesNamespacelessRows(t *testing.T) {
 	}
 }
 
-// TestSummableKeepsNamespacedAndNamespacelessApart pins that the two grouping
-// sets never cross. One namespace's container rows must not delete another
-// namespace's only row, which is why the namespaced key exists at all.
-func TestSummableKeepsNamespacedAndNamespacelessApart(t *testing.T) {
-	kept, _ := summable([]Series{
+// TestSummableKeepsNamespacedRowsApart pins that a namespaced total is still
+// judged on its own namespaced key: prod's container rows must not delete
+// staging's only row, which is why that key exists at all. Only the row naming
+// no namespace is ambiguous, and only that row is dropped.
+func TestSummableKeepsNamespacedRowsApart(t *testing.T) {
+	kept, _, ambiguous := summable([]Series{
 		gauge("m", map[string]string{"namespace": "prod", "pod": "web-0", "container": "app"}, 1),
 		gauge("m", map[string]string{"namespace": "staging", "pod": "web-0"}, 5),
 		gauge("m", map[string]string{"pod": "web-0"}, 9),
@@ -324,8 +337,46 @@ func TestSummableKeepsNamespacedAndNamespacelessApart(t *testing.T) {
 	for _, row := range kept {
 		values = append(values, row.Value)
 	}
-	if len(kept) != 3 {
-		t.Errorf("kept %v, want all three — no group may reach into another", values)
+	if len(kept) != 2 || values[0] != 1 || values[1] != 5 {
+		t.Errorf("kept %v, want prod's container row and staging's own total", values)
+	}
+	if len(ambiguous) != 1 || ambiguous[0] != "web-0" {
+		t.Errorf("ambiguous = %v, want only the namespace-less row reported", ambiguous)
+	}
+}
+
+// TestSummableNamespacelessOnlyIsNotAmbiguous pins the boundary: an exposition
+// that projects no namespace at ALL is a supported shape, not a misconfiguration.
+// Its rollup is still de-duplicated, but nothing is reported, so the diagnostic
+// cannot fire on every tick for a pipeline that is doing nothing wrong.
+func TestSummableNamespacelessOnlyIsNotAmbiguous(t *testing.T) {
+	kept, excluded, ambiguous := summable([]Series{
+		gauge("m", map[string]string{"pod": "api-1", "container": "app"}, 10),
+		gauge("m", map[string]string{"pod": "api-1"}, 10),
+	})
+
+	if excluded != 1 || len(kept) != 1 {
+		t.Errorf("kept %+v (excluded %d), want the rollup removed", kept, excluded)
+	}
+	if len(ambiguous) != 0 {
+		t.Errorf("ambiguous = %v, want none — this shape is unambiguous", ambiguous)
+	}
+}
+
+// TestSummableNamesEveryAmbiguousPodOnce pins that the report is stable and
+// deduplicated, so a diagnostic listing several pods does not reorder between
+// ticks or repeat a pod per dropped row.
+func TestSummableNamesEveryAmbiguousPodOnce(t *testing.T) {
+	_, _, ambiguous := summable([]Series{
+		gauge("m", map[string]string{"namespace": "prod", "pod": "web-0", "container": "app"}, 1),
+		gauge("m", map[string]string{"namespace": "prod", "pod": "api-9", "container": "app"}, 1),
+		gauge("m", map[string]string{"pod": "web-0"}, 5),
+		gauge("m", map[string]string{"pod": "web-0"}, 6),
+		gauge("m", map[string]string{"pod": "api-9"}, 7),
+	})
+
+	if len(ambiguous) != 2 || ambiguous[0] != "api-9" || ambiguous[1] != "web-0" {
+		t.Errorf("ambiguous = %v, want [api-9 web-0] — sorted and deduplicated", ambiguous)
 	}
 }
 

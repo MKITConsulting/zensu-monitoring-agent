@@ -91,8 +91,9 @@ func (a *Agent) Collect(ctx context.Context) ([]ServiceHeartbeat, error) {
 			if a.cfg.Interval > 0 {
 				entry.IntervalSeconds = int32(a.cfg.Interval.Seconds())
 			}
-			if sel := deploymentSelector(d); sel != "" {
-				var names []string
+			var names []string
+			sel := deploymentSelector(d)
+			if sel != "" {
 				if pods, err := a.lister.ListPods(ctx, ns, sel); err != nil {
 					a.log.Warn("list pods for restartCount failed", "deployment", d.Name, "error", err)
 				} else {
@@ -100,13 +101,13 @@ func (a *Agent) Collect(ctx context.Context) ([]ServiceHeartbeat, error) {
 					entry.RestartCount = &rc
 					names = podNames(pods)
 				}
-				targets = append(targets, ServiceTarget{
-					Slug:      entry.Slug,
-					Namespace: ns,
-					Selector:  sel,
-					PodNames:  names,
-				})
 			}
+			targets = append(targets, ServiceTarget{
+				Slug:      entry.Slug,
+				Namespace: ns,
+				Selector:  sel,
+				PodNames:  names,
+			})
 			claimed[entry.Slug] = ns + "/" + d.Name
 			out = append(out, entry)
 		}

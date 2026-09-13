@@ -92,6 +92,9 @@ rbac:
   create: true
 
 serviceAccount:
+  # With rbac.create on, turning this off without setting name below would bind
+  # the cluster-wide read ClusterRole to the namespace's "default" account, which
+  # every workload in that namespace shares. The chart refuses that render.
   create: true
   name: ""
 

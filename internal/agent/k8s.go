@@ -8,7 +8,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
@@ -144,14 +143,21 @@ func MapDeployment(d appsv1.Deployment) (ServiceHeartbeat, bool) {
 	}, true
 }
 
-// deploymentSelector renders a Deployment's pod selector (MatchLabels) as a
-// label-selector string. Returns "" when the Deployment has no MatchLabels, so
-// callers skip pod listing rather than accidentally matching every pod.
+// deploymentSelector renders a Deployment's pod selector as a label-selector
+// string, honouring MatchExpressions as well as MatchLabels — a Deployment may
+// legally carry only the former, and reading MatchLabels alone silently produced
+// no selector for it. Returns "" when the Deployment selects nothing or selects
+// everything, so callers skip pod listing rather than matching every pod in the
+// namespace.
 func deploymentSelector(d appsv1.Deployment) string {
-	if d.Spec.Selector == nil || len(d.Spec.Selector.MatchLabels) == 0 {
+	if d.Spec.Selector == nil {
 		return ""
 	}
-	return labels.Set(d.Spec.Selector.MatchLabels).AsSelector().String()
+	sel, err := metav1.LabelSelectorAsSelector(d.Spec.Selector)
+	if err != nil || sel.Empty() {
+		return ""
+	}
+	return sel.String()
 }
 
 // podNames lists the Pod names behind a service, used by metric sources that

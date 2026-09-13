@@ -53,6 +53,8 @@ type expositionSource struct {
 	memoryUnrateable atomic.Bool
 	cpuIncomplete    atomic.Bool
 	memoryIncomplete atomic.Bool
+	cpuAmbiguous     atomic.Bool
+	memoryAmbiguous  atomic.Bool
 	raterFullWarned  atomic.Bool
 }
 
@@ -268,6 +270,15 @@ func (s *expositionSource) reduce(out map[string][]MetricSample, sel scrape.Sele
 			"metric", sel.Candidate.Name, "rows", sel.Excluded)
 	}
 
+	ambiguousLatch := s.roleLatch(sel.Role, latchAmbiguous)
+	switch {
+	case len(sel.Ambiguous) == 0:
+		ambiguousLatch.Store(false)
+	case ambiguousLatch.CompareAndSwap(false, true):
+		s.log.Warn("dropped a pod-level total that names no namespace while the same metric carries namespaced container rows for that pod; the total cannot be attributed and summing it would double the pod, so project the namespace label consistently in the collector",
+			"metric", sel.Candidate.Name, "role", sel.Role.String(), "pods", sel.Ambiguous)
+	}
+
 	incompleteLatch := s.roleLatch(sel.Role, latchIncomplete)
 	switch {
 	case len(incomplete) == 0:
@@ -306,6 +317,7 @@ type latchKind int
 const (
 	latchUnrateable latchKind = iota
 	latchIncomplete
+	latchAmbiguous
 )
 
 // roleLatch returns the latch for one role and condition. Latches are per role
@@ -314,11 +326,17 @@ const (
 // misconfiguration would warn on every tick.
 func (s *expositionSource) roleLatch(role scrape.Role, kind latchKind) *atomic.Bool {
 	memory := role == scrape.RoleMemory
-	if kind == latchIncomplete {
+	switch kind {
+	case latchIncomplete:
 		if memory {
 			return &s.memoryIncomplete
 		}
 		return &s.cpuIncomplete
+	case latchAmbiguous:
+		if memory {
+			return &s.memoryAmbiguous
+		}
+		return &s.cpuAmbiguous
 	}
 	if memory {
 		return &s.memoryUnrateable

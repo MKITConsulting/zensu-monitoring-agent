@@ -711,3 +711,33 @@ func TestCollect_DuplicateSlugLatchIsPerPair(t *testing.T) {
 		t.Errorf("warnings = %d, want one per shadowed Deployment; got:\n%s", got, logged.String())
 	}
 }
+
+// TestCollect_TargetsWorkloadWithoutMatchLabels pins that a workload the pod
+// selector cannot render still reaches the metric source. The exposition
+// source's primary attribution path is the slug label, which needs neither a
+// selector nor pod names — withholding the target denied it resource metrics
+// outright.
+func TestCollect_TargetsWorkloadWithoutMatchLabels(t *testing.T) {
+	d := deployment("default", "api", "api", 1, 1)
+	d.Spec.Selector = &metav1.LabelSelector{}
+	spy := &spySource{}
+	a := New(Config{ProductID: "prod", Namespaces: []string{"default"}},
+		NewClientsetLister(fake.NewSimpleClientset(d), nil), &stubReporter{}, nil, spy)
+
+	got, err := a.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want the service reported, got %d", len(got))
+	}
+	if len(spy.calls) != 1 || len(spy.calls[0]) != 1 {
+		t.Fatalf("the workload must still be offered to the source, got %v", spy.calls)
+	}
+	if sel := spy.calls[0][0].Selector; sel != "" {
+		t.Errorf("Selector = %q, want empty so a selector-driven source skips it", sel)
+	}
+	if spy.calls[0][0].Slug != "api" {
+		t.Errorf("target identity wrong: %+v", spy.calls[0][0])
+	}
+}

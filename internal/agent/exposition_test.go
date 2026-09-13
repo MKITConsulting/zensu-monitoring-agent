@@ -1083,3 +1083,41 @@ func TestSlugIndexResolvePrefersExplicitLabel(t *testing.T) {
 		})
 	}
 }
+
+// TestExpositionSourceWarnsOnAmbiguousRollup pins that the dropped total is
+// reported at WARN and names the pod. The drop is a deliberate loss of data, so
+// leaving it at Debug — which no shipped build emits — would make it silent,
+// which is exactly what the drop was chosen over.
+func TestExpositionSourceWarnsOnAmbiguousRollup(t *testing.T) {
+	mixed := `# TYPE k8s_pod_memory_working_set_bytes gauge
+k8s_pod_memory_working_set_bytes{namespace="default",pod="api-1",container="app"} 100
+k8s_pod_memory_working_set_bytes{pod="api-1"} 100
+`
+	srv := newExpositionServer(t, mixed)
+	src, buf := loggedSource(t, srv.URL, ExpositionConfig{})
+
+	targets := []ServiceTarget{{Slug: "api", Namespace: "default", PodNames: []string{"api-1"}}}
+	got, err := src.Samples(context.Background(), targets)
+	if err != nil {
+		t.Fatalf("Samples: %v", err)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "names no namespace") {
+		t.Errorf("the dropped total must be reported; log:\n%s", logged)
+	}
+	if !strings.Contains(logged, "api-1") {
+		t.Errorf("the warning must name the pod so the relabel rule can be found; log:\n%s", logged)
+	}
+	if v := samplesByKey(t, got, "api")[MetricMemoryBytes]; v != 100 {
+		t.Errorf("memory = %v, want 100 — the container row alone, not doubled", v)
+	}
+
+	before := strings.Count(buf.String(), "names no namespace")
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("second Samples: %v", err)
+	}
+	if after := strings.Count(buf.String(), "names no namespace"); after != before {
+		t.Errorf("the diagnostic fired again on an unchanged exposition (%d -> %d); a standing misconfiguration costs one line", before, after)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/url"
 	"sync/atomic"
+	"time"
 
 	obs "github.com/MKITConsulting/zensu-monitoring-agent/internal/metrics"
 )
@@ -85,6 +86,9 @@ func (s *metricsServerSource) Name() string { return SourceMetricsServer }
 func (s *metricsServerSource) Samples(ctx context.Context, targets []ServiceTarget) (map[string][]MetricSample, error) {
 	out := make(map[string][]MetricSample, len(targets))
 	for _, t := range targets {
+		if t.Selector == "" {
+			continue
+		}
 		cpu, mem, available, err := s.reader.PodMetricsForSelector(ctx, t.Namespace, t.Selector)
 		if err != nil {
 			if errors.Is(err, ErrMetricsAPIUnavailable) {
@@ -117,15 +121,39 @@ func (noneSource) Samples(context.Context, []ServiceTarget) (map[string][]Metric
 	return nil, nil
 }
 
-// autoSource reads metrics-server and switches permanently to the exposition
-// the first time the cluster reports no metrics.k8s.io API. The switch is
-// one-way by design: a cluster does not grow a metrics-server mid-flight, and
-// re-probing every tick would log a warning every tick.
+// autoRetryInterval is how long the composite stays on the fallback before it
+// re-probes the primary.
+const autoRetryInterval = 5 * time.Minute
+
+// autoSource reads metrics-server and switches to the exposition when the
+// cluster reports no metrics.k8s.io API. The switch is reversible on a cooldown
+// rather than permanent, because "unavailable" is not proof the cluster will
+// never serve it: a metrics-server rollout answers NotFound for the length of
+// one deployment, and an operator who installs metrics-server later expects the
+// agent to pick it up without a restart. Re-probing on a cooldown keeps that
+// recovery without probing — or logging — every tick.
 type autoSource struct {
-	primary  MetricSource
-	fallback MetricSource
-	log      *slog.Logger
-	switched atomic.Bool
+	primary    MetricSource
+	fallback   MetricSource
+	log        *slog.Logger
+	now        func() time.Time
+	switched   atomic.Bool
+	switchedAt atomic.Int64
+}
+
+// clock reads the injected time source, defaulting to the wall clock.
+func (s *autoSource) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// dueForRetry reports whether the cooldown since the last unavailable primary
+// read has elapsed.
+func (s *autoSource) dueForRetry() bool {
+	last := s.switchedAt.Load()
+	return last == 0 || s.clock().UnixNano()-last >= int64(autoRetryInterval)
 }
 
 func (s *autoSource) Name() string {
@@ -136,15 +164,20 @@ func (s *autoSource) Name() string {
 }
 
 func (s *autoSource) Samples(ctx context.Context, targets []ServiceTarget) (map[string][]MetricSample, error) {
-	if s.switched.Load() {
+	if s.switched.Load() && !s.dueForRetry() {
 		return s.fallback.Samples(ctx, targets)
 	}
 
 	out, err := s.primary.Samples(ctx, targets)
 	if !errors.Is(err, ErrSourceUnavailable) {
+		if err == nil && s.switched.CompareAndSwap(true, false) {
+			s.log.Info("primary resource source is available again; reading CPU/memory from it",
+				"primary", s.primary.Name(), "fallback", s.fallback.Name())
+		}
 		return out, err
 	}
 
+	s.switchedAt.Store(s.clock().UnixNano())
 	if s.switched.CompareAndSwap(false, true) {
 		s.log.Info("primary resource source unavailable; reading CPU/memory from the configured exposition instead",
 			"primary", s.primary.Name(), "fallback", s.fallback.Name())
@@ -235,7 +268,7 @@ func validateURL(raw string) error {
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
 		return errors.New("needs an http:// or https:// scheme")
 	}
-	if parsed.Host == "" {
+	if parsed.Hostname() == "" {
 		return errors.New("needs a host")
 	}
 	return nil

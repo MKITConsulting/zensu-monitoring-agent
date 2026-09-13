@@ -1,6 +1,9 @@
 package scrape
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // Role is one of the two resource metrics the Zensu metric registry recognizes.
 type Role int
@@ -96,6 +99,12 @@ type Selection struct {
 	Kind      Kind
 	Series    []Series
 	Excluded  int
+	// Ambiguous names the pods whose namespace-less total was dropped because
+	// the same family also carries namespaced container rows for that pod name.
+	// The row cannot be attributed, so it is dropped rather than summed on top
+	// of rows that already cover it — and reported, because the cause is a
+	// relabel rule the operator can fix.
+	Ambiguous []string
 }
 
 // Rateable reports whether this selection may be differenced into a per-second
@@ -121,35 +130,69 @@ func (s Selection) Rateable() bool {
 //     rows for one pod and only a pod-level row for another.
 //
 // Rows are grouped by namespace+pod when they carry both labels and by pod name
-// alone when they carry no namespace, and the two sets never cross. Keeping them
-// apart is what stops a pod name repeated across namespaces from deleting
-// another namespace's only row, while still de-duplicating an exposition that
-// projects no namespace at all — which the pod-only slug fallback supports and
-// which would otherwise double every pod that has both shapes.
-func summable(rows []Series) ([]Series, int) {
+// alone when they carry no namespace. A namespaced container row registers under
+// BOTH keys, because one family may mix label shapes for the same pod: without
+// the pod-only key its namespace-less total consults an empty set and is summed
+// on top of the container rows that already cover it, shipping that pod at
+// roughly double.
+//
+// The bridge only ever suppresses a total that names no namespace. Such a row is
+// genuinely ambiguous — it may be this pod's total, or a same-named pod's only
+// row in another namespace — and no rule can tell which. Dropping it is the
+// direction that never inflates a reported figure, and every dropped row is
+// named in Ambiguous so the caller can report the relabel rule that produced it
+// rather than leaving the loss silent. A namespaced total is still judged on its
+// own namespaced key, so one namespace's containers cannot delete another
+// namespace's row.
+func summable(rows []Series) ([]Series, int, []string) {
 	rollupNamespaced := map[string]bool{}
 	rollupPodOnly := map[string]bool{}
+	mixedShape := map[string]bool{}
 	for _, row := range rows {
 		if !isContainerRow(row) {
 			continue
 		}
+		pod := PodLabel(row.Labels)
 		if key, ok := row.podRef(); ok {
 			rollupNamespaced[key] = true
+			rollupPodOnly[pod] = true
+			mixedShape[pod] = true
 			continue
 		}
-		if pod := PodLabel(row.Labels); pod != "" && NamespaceLabel(row.Labels) == "" {
+		if pod != "" && NamespaceLabel(row.Labels) == "" {
 			rollupPodOnly[pod] = true
 		}
 	}
 
 	out := make([]Series, 0, len(rows))
+	ambiguous := map[string]bool{}
 	for _, row := range rows {
-		if isPauseRow(row) || isSupersededRollup(row, rollupNamespaced, rollupPodOnly) {
+		if isPauseRow(row) {
+			continue
+		}
+		if isSupersededRollup(row, rollupNamespaced, rollupPodOnly) {
+			if pod := PodLabel(row.Labels); NamespaceLabel(row.Labels) == "" && mixedShape[pod] {
+				ambiguous[pod] = true
+			}
 			continue
 		}
 		out = append(out, row)
 	}
-	return out, len(rows) - len(out)
+	return out, len(rows) - len(out), sortedKeys(ambiguous)
+}
+
+// sortedKeys renders a set as a stable slice, so a diagnostic naming several
+// pods does not reorder between ticks.
+func sortedKeys(set map[string]bool) []string {
+	if len(set) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // isPauseRow reports whether row measures cAdvisor's pause pseudo-container.
@@ -265,8 +308,15 @@ func (r Resolver) Select(role Role, all []Series) (Selection, bool) {
 	for _, candidate := range r.candidates(role) {
 		matched, kind, ok := matchFamily(candidate, all)
 		if ok {
-			rows, excluded := summable(matched)
-			return Selection{Candidate: candidate, Role: role, Kind: kind, Series: rows, Excluded: excluded}, true
+			rows, excluded, ambiguous := summable(matched)
+			return Selection{
+				Candidate: candidate,
+				Role:      role,
+				Kind:      kind,
+				Series:    rows,
+				Excluded:  excluded,
+				Ambiguous: ambiguous,
+			}, true
 		}
 	}
 	return Selection{}, false

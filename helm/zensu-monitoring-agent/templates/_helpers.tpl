@@ -87,6 +87,9 @@ says, because the ConfigMap key is written in every mode.
 {{- end }}
 {{- end }}
 {{- end }}
+{{- if and .Values.rbac.create (not .Values.serviceAccount.create) (not .Values.serviceAccount.name) }}
+{{- fail "rbac.create with serviceAccount.create=false and no serviceAccount.name would bind the cluster-wide read ClusterRole to the namespace's \"default\" ServiceAccount, granting it to every workload in the namespace that uses it; set serviceAccount.name to the account the agent actually runs as, or leave serviceAccount.create enabled" }}
+{{- end }}
 {{- if .Values.metrics.networkPolicy.enabled }}
 {{- if not .Values.metrics.networkPolicy.from }}
 {{- fail "metrics.networkPolicy.from must name the allowed sources; an empty list allows every source, which is not the hardening the flag implies" }}
