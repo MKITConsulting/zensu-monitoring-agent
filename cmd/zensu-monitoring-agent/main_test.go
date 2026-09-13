@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/MKITConsulting/zensu-monitoring-agent/internal/agent"
 )
@@ -180,18 +186,152 @@ func TestRequiredConfig(t *testing.T) {
 	}
 }
 
-// TestRequiredConfigChecksTheScrapeURLInEveryMode pins that the scrape URL is
-// refused whatever resourceMetrics.source says. The chart writes its ConfigMap
-// key in every mode, so a credential in an unused scrape URL is exposed just the
-// same as in a used one.
-func TestRequiredConfigChecksTheScrapeURLInEveryMode(t *testing.T) {
+// fakeLister builds the cluster reader run() would otherwise get from the
+// in-cluster config, which no test can have.
+func fakeLister() (agent.ClusterReader, error) {
+	return agent.NewClientsetLister(fake.NewSimpleClientset(), nil), nil
+}
+
+// startupEnv sets the three always-required variables plus a heartbeat URL that
+// accepts anything, so a test can vary exactly the one knob it is about.
+func startupEnv(t *testing.T) {
+	t.Helper()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(backend.Close)
+	t.Setenv("ZENSU_API_URL", backend.URL)
+	t.Setenv("ZENSU_API_KEY", "zsk_x")
+	t.Setenv("ZENSU_PRODUCT_ID", "p")
+	t.Setenv("ZENSU_MONITORING_AGENT_NAMESPACES", "default")
+	t.Setenv("ZENSU_MONITORING_AGENT_METRICS_ADDR", "127.0.0.1:0")
+}
+
+// runStartup drives run() to the point where startup either refuses or the agent
+// begins, with a context already cancelled so the loop returns at once. The
+// startup decisions are what these tests are about; the loop is covered in
+// internal/agent.
+func runStartup(t *testing.T, once bool) (string, error) {
+	t.Helper()
+	var buf strings.Builder
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := run(ctx, log, once, fakeLister)
+	return buf.String(), err
+}
+
+// TestRunRefusesExpositionWithoutURL pins the guard the chart does not duplicate:
+// resourceMetrics.source=exposition with no scrapeUrl is a plausible
+// misconfiguration, and this exit is its only defence. It lived inside main()
+// where nothing could reach it.
+func TestRunRefusesExpositionWithoutURL(t *testing.T) {
+	startupEnv(t)
+	t.Setenv("ZENSU_MONITORING_AGENT_RESOURCE_SOURCE", "exposition")
+	t.Setenv("ZENSU_MONITORING_AGENT_SCRAPE_URL", "")
+
+	_, err := runStartup(t, false)
+	if err == nil {
+		t.Fatal("expected startup to refuse exposition mode without a scrape URL")
+	}
+	if !strings.Contains(err.Error(), "resource metric source") {
+		t.Errorf("err = %v, want it to name the stage that refused", err)
+	}
+	if !strings.Contains(err.Error(), "requires a scrape URL") {
+		t.Errorf("err = %v, want it to name the missing value", err)
+	}
+}
+
+// TestRunRefusesUnknownSource pins the other half of the same exit: a typo in the
+// mode is refused at startup rather than silently degrading to no metrics.
+func TestRunRefusesUnknownSource(t *testing.T) {
+	startupEnv(t)
+	t.Setenv("ZENSU_MONITORING_AGENT_RESOURCE_SOURCE", "prometheus")
+
+	_, err := runStartup(t, false)
+	if err == nil || !strings.Contains(err.Error(), "unknown resource source") {
+		t.Fatalf("err = %v, want the unknown-source refusal", err)
+	}
+}
+
+// TestRunRefusesTheScrapeURLInEveryMode pins that the scrape URL is refused
+// whatever resourceMetrics.source says. The chart writes its ConfigMap key in
+// every mode, so a credential in an unused scrape URL is exposed just the same as
+// in a used one. It drives run() rather than requiredConfig, because the mode is
+// only an input at this level: requiredConfig does not read it, so calling that
+// per mode asserted the same thing five times and would survive someone
+// reintroducing mode-conditional validation in the caller.
+func TestRunRefusesTheScrapeURLInEveryMode(t *testing.T) {
 	for _, mode := range []string{"none", "metrics-server", "exposition", "auto", ""} {
 		t.Run("mode="+mode, func(t *testing.T) {
+			startupEnv(t)
 			t.Setenv("ZENSU_MONITORING_AGENT_RESOURCE_SOURCE", mode)
+			t.Setenv("ZENSU_MONITORING_AGENT_SCRAPE_URL", "http://u:p@collector:8889/metrics")
 
-			err := requiredConfig("https://api.zensu.dev", "zsk_x", "p", "http://u:p@collector:8889/metrics")
+			_, err := runStartup(t, false)
 			if err == nil || !strings.Contains(err.Error(), "carries credentials") {
-				t.Errorf("err = %v, want the credential refusal", err)
+				t.Fatalf("err = %v, want the credential refusal", err)
+			}
+			if strings.Contains(err.Error(), ":p@") || strings.Contains(err.Error(), "collector") {
+				t.Errorf("the error must not echo the configured value, got %v", err)
+			}
+		})
+	}
+}
+
+// TestRunWarnsOnceModeCannotRateCounters pins the caveat a CronJob operator has
+// no other way to learn: one process per run means a counter never gets its
+// second observation, so CPU is absent on every run while memory reports.
+func TestRunWarnsOnceModeCannotRateCounters(t *testing.T) {
+	startupEnv(t)
+	t.Setenv("ZENSU_MONITORING_AGENT_SCRAPE_URL", "http://collector:8889/metrics")
+
+	logged, err := runStartup(t, true)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if !strings.Contains(logged, "one-shot mode cannot rate cumulative counters") {
+		t.Errorf("a cronjob with a scrape URL must carry the caveat; log:\n%s", logged)
+	}
+}
+
+// TestRunSkipsTheOnceCaveatWithoutAnExposition is the negative half: the caveat
+// is about scraping, so a cronjob that cannot scrape must not carry it.
+func TestRunSkipsTheOnceCaveatWithoutAnExposition(t *testing.T) {
+	startupEnv(t)
+	t.Setenv("ZENSU_MONITORING_AGENT_SCRAPE_URL", "")
+
+	logged, err := runStartup(t, true)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if strings.Contains(logged, "one-shot mode cannot rate cumulative counters") {
+		t.Errorf("a cronjob with no exposition must not carry the caveat; log:\n%s", logged)
+	}
+}
+
+// TestRunGatesMetricsOnLongRunningMode pins the hoisted metrics block: the
+// agent's own endpoint is meaningless in a one-shot run, where nothing would ever
+// scrape it before the process exits.
+func TestRunGatesMetricsOnLongRunningMode(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		once bool
+		want bool
+	}{
+		{name: "long-running serves metrics", once: false, want: true},
+		{name: "one-shot does not", once: true, want: false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			startupEnv(t)
+			t.Setenv("ZENSU_MONITORING_AGENT_METRICS_ENABLED", "true")
+
+			logged, err := runStartup(t, c.once)
+			if err != nil {
+				t.Fatalf("run: %v", err)
+			}
+			if got := strings.Contains(logged, "metrics endpoint enabled"); got != c.want {
+				t.Errorf("metrics endpoint enabled = %v, want %v; log:\n%s", got, c.want, logged)
 			}
 		})
 	}

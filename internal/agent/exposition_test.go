@@ -933,11 +933,38 @@ container_cpu_usage_seconds_total{zensu_service="api"} 1
 	if _, err := src.Samples(context.Background(), []ServiceTarget{{Slug: "api"}}); err != nil {
 		t.Fatalf("Samples: %v", err)
 	}
-	if !strings.Contains(buf.String(), "override matched nothing") {
-		t.Errorf("an override that resolves to nothing must be reported; log:\n%s", buf.String())
+	if got := strings.Count(buf.String(), "override matched nothing"); got != 1 {
+		t.Fatalf("an override that resolves to nothing must be reported once, got %d; log:\n%s", got, buf.String())
 	}
 	if !strings.Contains(buf.String(), "container_cpu_usage") {
 		t.Errorf("the warning must name the override; log:\n%s", buf.String())
+	}
+
+	// A second tick against the same exposition. One tick plus a Contains cannot
+	// tell a latched line from one printed every tick — deleting the
+	// CompareAndSwap in warnRoleUnresolved would leave that shape green.
+	if _, err := src.Samples(context.Background(), []ServiceTarget{{Slug: "api"}}); err != nil {
+		t.Fatalf("second Samples: %v", err)
+	}
+	if got := strings.Count(buf.String(), "override matched nothing"); got != 1 {
+		t.Errorf("a standing mismatch must cost one line, got %d; log:\n%s", got, buf.String())
+	}
+
+	// The pipeline is repaired, which clears the latch, then breaks again.
+	srv.setBody(`# TYPE container_cpu_usage gauge
+container_cpu_usage{zensu_service="api"} 1
+`)
+	if _, err := src.Samples(context.Background(), []ServiceTarget{{Slug: "api"}}); err != nil {
+		t.Fatalf("Samples after repair: %v", err)
+	}
+	srv.setBody(`# TYPE container_cpu_usage_seconds_total gauge
+container_cpu_usage_seconds_total{zensu_service="api"} 1
+`)
+	if _, err := src.Samples(context.Background(), []ServiceTarget{{Slug: "api"}}); err != nil {
+		t.Fatalf("Samples after the second break: %v", err)
+	}
+	if got := strings.Count(buf.String(), "override matched nothing"); got != 2 {
+		t.Errorf("a repaired then re-broken override must be reported afresh, got %d; log:\n%s", got, buf.String())
 	}
 }
 
@@ -994,9 +1021,11 @@ container_cpu_usage_seconds_total{pod="api-1",namespace="prod"} 100
 	if _, err := src.Samples(context.Background(), targets); err != nil {
 		t.Fatalf("first Samples: %v", err)
 	}
+	// api-2 appears carrying an id label. It has no predecessor, so its rate is
+	// missing and the whole role is withheld for the service.
 	srv.setBody(`# TYPE container_cpu_usage_seconds_total counter
 container_cpu_usage_seconds_total{pod="api-1",namespace="prod"} 130
-container_cpu_usage_seconds_total{pod="api-2",namespace="prod"} 900
+container_cpu_usage_seconds_total{pod="api-2",namespace="prod",id="a"} 900
 `)
 	clock.t = clock.t.Add(60 * time.Second)
 
@@ -1005,6 +1034,53 @@ container_cpu_usage_seconds_total{pod="api-2",namespace="prod"} 900
 	}
 	if got := strings.Count(buf.String(), "withholding a role"); got != 1 {
 		t.Errorf("withheld count = %d, want exactly 1; log:\n%s", got, buf.String())
+	}
+
+	// A third tick that is genuinely ELIGIBLE and carries the same withheld set:
+	// api-2's id label changed, so its fingerprint is new again and it still has
+	// no predecessor. Without an eligible repeat the test cannot tell "reported
+	// once" from "reports every tick" — tick 1 is suppressed by the
+	// first-observation gate, and simply re-scraping tick 2's body would resolve
+	// api-2's rate and withhold nothing at all.
+	srv.setBody(`# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{pod="api-1",namespace="prod"} 160
+container_cpu_usage_seconds_total{pod="api-2",namespace="prod",id="b"} 910
+`)
+	clock.t = clock.t.Add(60 * time.Second)
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("third Samples: %v", err)
+	}
+	if got := strings.Count(buf.String(), "withholding a role"); got != 1 {
+		t.Errorf("withheld count = %d after an unchanged set, want still 1; log:\n%s", got, buf.String())
+	}
+
+	// api-2 repeats its series, so both pods report, nothing is withheld and the
+	// report clears. Nothing else in the suite executes that branch.
+	srv.setBody(`# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{pod="api-1",namespace="prod"} 190
+container_cpu_usage_seconds_total{pod="api-2",namespace="prod",id="b"} 950
+`)
+	clock.t = clock.t.Add(60 * time.Second)
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("fourth Samples: %v", err)
+	}
+	if got := src.withheldReport(scrape.RoleCPU).Load(); got != nil {
+		t.Errorf("the report holds %q after a clean tick, want it cleared", *got)
+	}
+
+	// api-2 restarts, so its counter resets and the rater skips that tick rather
+	// than reporting a negative rate. A cleared report must re-arm, or a pipeline
+	// that breaks twice is only ever reported once.
+	srv.setBody(`# TYPE container_cpu_usage_seconds_total counter
+container_cpu_usage_seconds_total{pod="api-1",namespace="prod"} 220
+container_cpu_usage_seconds_total{pod="api-2",namespace="prod",id="b"} 5
+`)
+	clock.t = clock.t.Add(60 * time.Second)
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("fifth Samples: %v", err)
+	}
+	if got := strings.Count(buf.String(), "withholding a role"); got != 2 {
+		t.Errorf("withheld count = %d, want 2 — a repaired then re-broken pipeline is reported afresh; log:\n%s", got, buf.String())
 	}
 }
 

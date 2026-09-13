@@ -468,11 +468,30 @@ func TestRun_LoopsUntilContextCancelled(t *testing.T) {
 	a := New(Config{ProductID: "p", Namespaces: []string{"default"}, Interval: 50 * time.Millisecond},
 		NewClientsetLister(client, nil), rep, log, noneSource{})
 
+	started := time.Now()
+	var firstCall time.Duration
+	inner := rep.onCall
+	rep.onCall = func(n int) {
+		if n == 1 {
+			firstCall = time.Since(started)
+		}
+		inner(n)
+	}
+
 	if err := a.Run(ctx, false); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run = %v, want context.Canceled", err)
 	}
 	if rep.calls < 2 {
 		t.Errorf("calls = %d, want at least 2 — one immediate tick and one from the ticker", rep.calls)
+	}
+	// A lower bound on the call count cannot see the pre-loop tick: without it the
+	// ticker alone reaches two calls and every other assertion here still holds.
+	// The timing is what distinguishes them, and in production it is the whole
+	// point — otherwise the agent reports nothing for a full interval after a
+	// rollout. Half the interval is far outside the noise of a fake clientset.
+	if firstCall > a.cfg.Interval/2 {
+		t.Errorf("first heartbeat took %v, want well under the %v interval — Run must tick once before entering the loop",
+			firstCall, a.cfg.Interval)
 	}
 	if got := strings.Count(buf.String(), "heartbeat tick failed"); got != 1 {
 		t.Errorf("logged %d tick failures, want 1 — the tick cancelled by shutdown is not a fault; log:\n%s", got, buf.String())

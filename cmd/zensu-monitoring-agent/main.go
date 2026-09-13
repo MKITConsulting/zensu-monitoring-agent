@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -30,13 +31,28 @@ func main() {
 
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, log, *once, agent.NewInClusterLister); err != nil {
+		log.Error("agent stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+// run is main() without the process-level concerns, so the startup path can be
+// exercised by a test. Every refusal main() used to inline as an os.Exit is a
+// wrapped error here, naming the stage that refused; main() logs it and exits.
+// newLister is injected because the real one needs a cluster, and every startup
+// decision below it — the source refusal, the one-shot counter caveat, whether
+// metrics are constructed at all — sits behind that call.
+func run(ctx context.Context, log *slog.Logger, once bool, newLister func() (agent.ClusterReader, error)) error {
 	apiURL := os.Getenv("ZENSU_API_URL")
 	apiKey := os.Getenv("ZENSU_API_KEY")
 	productID := os.Getenv("ZENSU_PRODUCT_ID")
 	scrapeURL := os.Getenv("ZENSU_MONITORING_AGENT_SCRAPE_URL")
 	if err := requiredConfig(apiURL, apiKey, productID, scrapeURL); err != nil {
-		log.Error("invalid configuration", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("invalid configuration: %w", err)
 	}
 
 	cfg := agent.Config{
@@ -46,15 +62,14 @@ func main() {
 		Interval:   envDuration("ZENSU_MONITORING_AGENT_INTERVAL", 60*time.Second),
 	}
 
-	lister, err := agent.NewInClusterLister()
+	lister, err := newLister()
 	if err != nil {
-		log.Error("kubernetes client", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("kubernetes client: %w", err)
 	}
 	reporter := agent.NewReporter(apiURL, apiKey, 15*time.Second)
 
 	var m *obs.Metrics
-	metricsEnabled := envBool("ZENSU_MONITORING_AGENT_METRICS_ENABLED", true) && !*once
+	metricsEnabled := envBool("ZENSU_MONITORING_AGENT_METRICS_ENABLED", true) && !once
 	if metricsEnabled {
 		m = obs.New()
 		reporter.Metrics = m
@@ -63,20 +78,16 @@ func main() {
 	sourceCfg := resourceSourceConfig(scrapeURL)
 	source, err := agent.NewMetricSource(sourceCfg, lister, log, m)
 	if err != nil {
-		log.Error("resource metric source", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("resource metric source: %w", err)
 	}
 	log.Info("resource metric source configured", "source", source.Name())
-	if *once && expositionReachable(sourceCfg) {
+	if once && expositionReachable(sourceCfg) {
 		log.Warn("one-shot mode cannot rate cumulative counters: a counter-based CPU metric needs two consecutive scrapes in one process, so CPU will be absent on every run while memory still reports",
 			"mode", "cronjob", "source", source.Name())
 	}
 
 	a := agent.New(cfg, lister, reporter, log, source)
 	a.Metrics = m
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	if metricsEnabled {
 		addr := envOr("ZENSU_MONITORING_AGENT_METRICS_ADDR", obs.DefaultAddr)
@@ -88,10 +99,10 @@ func main() {
 		}()
 	}
 
-	if err := a.Run(ctx, *once); err != nil && ctx.Err() == nil {
-		log.Error("agent stopped", "error", err)
-		os.Exit(1)
+	if err := a.Run(ctx, once); err != nil && ctx.Err() == nil {
+		return err
 	}
+	return nil
 }
 
 // requiredConfig holds the startup refusals main() would otherwise inline, where
