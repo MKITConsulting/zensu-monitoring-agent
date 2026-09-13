@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -739,5 +740,54 @@ func TestCollect_TargetsWorkloadWithoutMatchLabels(t *testing.T) {
 	}
 	if spy.calls[0][0].Slug != "api" {
 		t.Errorf("target identity wrong: %+v", spy.calls[0][0])
+	}
+}
+
+// TestWarnDuplicateSlugIsBounded pins the ceiling on the duplicate-slug latch.
+// Both halves of its key are cluster-controlled and it lives for the process
+// lifetime, so a churny cluster — preview environments, per-PR namespaces — would
+// otherwise grow it without limit inside a 64Mi container.
+func TestWarnDuplicateSlugIsBounded(t *testing.T) {
+	var buf strings.Builder
+	a := New(Config{ProductID: "p"}, nil, &stubReporter{},
+		slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})), nil)
+
+	for i := 0; i < MaxWarnedSlugPairs+50; i++ {
+		a.warnDuplicateSlug("api", "default/api", fmt.Sprintf("ns-%d/api", i))
+	}
+
+	a.warnedMu.Lock()
+	size := len(a.warnedSlugs)
+	a.warnedMu.Unlock()
+	if size != MaxWarnedSlugPairs {
+		t.Errorf("latched %d pairs, want the cap %d", size, MaxWarnedSlugPairs)
+	}
+
+	logged := buf.String()
+	if got := strings.Count(logged, "too many distinct duplicate service slugs"); got != 1 {
+		t.Errorf("the overflow must be said exactly once, got %d", got)
+	}
+	if got := strings.Count(logged, "claimed by more than one Deployment"); got != MaxWarnedSlugPairs {
+		t.Errorf("named %d pairs, want %d before the cap", got, MaxWarnedSlugPairs)
+	}
+}
+
+// TestWarnDuplicateSlugLatchesPerPair pins the behaviour the cap must not break:
+// a standing two-namespace misconfiguration costs one line, and a different
+// workload later claiming the same slug is reported as the new fact it is.
+func TestWarnDuplicateSlugLatchesPerPair(t *testing.T) {
+	var buf strings.Builder
+	a := New(Config{ProductID: "p"}, nil, &stubReporter{},
+		slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})), nil)
+
+	a.warnDuplicateSlug("api", "default/api", "other/api")
+	a.warnDuplicateSlug("api", "default/api", "other/api")
+	if got := strings.Count(buf.String(), "claimed by more than one Deployment"); got != 1 {
+		t.Errorf("a repeated pair must cost one line, got %d", got)
+	}
+
+	a.warnDuplicateSlug("api", "default/api", "third/api")
+	if got := strings.Count(buf.String(), "claimed by more than one Deployment"); got != 2 {
+		t.Errorf("a new shadowing workload must be reported, got %d lines", got)
 	}
 }

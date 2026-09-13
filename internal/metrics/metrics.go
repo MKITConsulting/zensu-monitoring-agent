@@ -24,6 +24,7 @@ type Metrics struct {
 	scrapes                *prometheus.CounterVec
 	scrapeDuration         prometheus.Histogram
 	resourceServicesMapped prometheus.Gauge
+	rolesWithheld          *prometheus.GaugeVec
 }
 
 func New() *Metrics {
@@ -63,15 +64,21 @@ func NewWithRegistry(reg *prometheus.Registry) *Metrics {
 			Name: "zensu_monitoring_agent_resource_services_mapped",
 			Help: "Number of services that received resource samples in the last tick, whatever the source.",
 		}),
+		rolesWithheld: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "zensu_monitoring_agent_resource_roles_withheld",
+			Help: "Number of services whose role was withheld in the last tick because not all of their rows produced a rate.",
+		}, []string{"role"}),
 	}
 	reg.MustRegister(m.heartbeats, m.lastSuccess, m.postDuration, m.servicesReported)
-	reg.MustRegister(m.scrapes, m.scrapeDuration, m.resourceServicesMapped)
+	reg.MustRegister(m.scrapes, m.scrapeDuration, m.resourceServicesMapped, m.rolesWithheld)
 	reg.MustRegister(collectors.NewGoCollector())
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	m.heartbeats.WithLabelValues("success")
 	m.heartbeats.WithLabelValues("error")
 	m.scrapes.WithLabelValues("success")
 	m.scrapes.WithLabelValues("error")
+	m.rolesWithheld.WithLabelValues("cpu")
+	m.rolesWithheld.WithLabelValues("memory")
 	return m
 }
 
@@ -116,6 +123,16 @@ func (m *Metrics) SetResourceServicesMapped(n int) {
 		return
 	}
 	m.resourceServicesMapped.Set(float64(n))
+}
+
+// SetRolesWithheld records how many services had this role withheld. It is the
+// counterpart to the withheld-role warning, which is latched and therefore
+// cannot express a condition that persists or grows; this gauge can.
+func (m *Metrics) SetRolesWithheld(role string, n int) {
+	if m == nil {
+		return
+	}
+	m.rolesWithheld.WithLabelValues(role).Set(float64(n))
 }
 
 func (m *Metrics) Handler() http.Handler {

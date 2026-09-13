@@ -10,6 +10,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1119,5 +1120,144 @@ k8s_pod_memory_working_set_bytes{pod="api-1"} 100
 	}
 	if after := strings.Count(buf.String(), "names no namespace"); after != before {
 		t.Errorf("the diagnostic fired again on an unchanged exposition (%d -> %d); a standing misconfiguration costs one line", before, after)
+	}
+}
+
+// counterExposition renders one cumulative CPU family whose rows carry the given
+// churn token, so consecutive scrapes can be made to share or not share a series
+// fingerprint the way a scraped peer decides.
+func counterExposition(churn string) string {
+	return `# TYPE k8s_pod_cpu_time counter
+k8s_pod_cpu_time{zensu_service="api",churn="` + churn + `"} 10
+`
+}
+
+// TestWithheldRoleNamesTheServices pins that withholding a role says WHICH
+// services lost it. The condition is one a scraped peer can drive — it chooses
+// the fingerprints — so a count alone leaves an operator with no way to tell a
+// legitimate first observation from a service being suppressed.
+func TestWithheldRoleNamesTheServices(t *testing.T) {
+	var body atomic.Value
+	body.Store(counterExposition("a"))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(body.Load().(string)))
+	}))
+	t.Cleanup(srv.Close)
+
+	src, buf := loggedSource(t, srv.URL, ExpositionConfig{})
+	targets := []ServiceTarget{{Slug: "api", Namespace: "default"}}
+
+	// Tick 1 is the first observation: a counter has no predecessor yet, which is
+	// normal and must not warn.
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("first Samples: %v", err)
+	}
+	if logged := buf.String(); strings.Contains(logged, "withholding a role") {
+		t.Errorf("the first observation must not warn; log:\n%s", logged)
+	}
+
+	// Tick 2 carries a different churn label, so the peer never repeats a series
+	// and the service stays without a rate.
+	body.Store(counterExposition("b"))
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("second Samples: %v", err)
+	}
+
+	logged := buf.String()
+	if !strings.Contains(logged, "withholding a role") {
+		t.Fatalf("a standing withheld role must be reported; log:\n%s", logged)
+	}
+	if !strings.Contains(logged, "api") {
+		t.Errorf("the warning must name the withheld service; log:\n%s", logged)
+	}
+}
+
+// TestWithheldRoleRearmsOnAChangedSet pins that the report follows the SET, not a
+// flag. A boolean latch clears only on a tick that withholds nothing, which a
+// standing condition prevents — so a peer suppressing one service would mask
+// every service it suppresses afterwards.
+func TestWithheldRoleRearmsOnAChangedSet(t *testing.T) {
+	var body atomic.Value
+	body.Store(`# TYPE k8s_pod_cpu_time counter
+k8s_pod_cpu_time{zensu_service="api",churn="a"} 10
+`)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(body.Load().(string)))
+	}))
+	t.Cleanup(srv.Close)
+
+	src, buf := loggedSource(t, srv.URL, ExpositionConfig{})
+	targets := []ServiceTarget{{Slug: "api"}, {Slug: "web"}}
+
+	for i, next := range []string{
+		`# TYPE k8s_pod_cpu_time counter
+k8s_pod_cpu_time{zensu_service="api",churn="b"} 10
+`,
+		`# TYPE k8s_pod_cpu_time counter
+k8s_pod_cpu_time{zensu_service="api",churn="c"} 10
+`,
+	} {
+		if _, err := src.Samples(context.Background(), targets); err != nil {
+			t.Fatalf("Samples %d: %v", i, err)
+		}
+		body.Store(next)
+	}
+	if got := strings.Count(buf.String(), "withholding a role"); got != 1 {
+		t.Fatalf("an unchanged withheld set must cost one line, got %d; log:\n%s", got, buf.String())
+	}
+
+	// A second victim joins the set, which is new information and must be said.
+	body.Store(`# TYPE k8s_pod_cpu_time counter
+k8s_pod_cpu_time{zensu_service="api",churn="d"} 10
+k8s_pod_cpu_time{zensu_service="web",churn="d"} 10
+`)
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("Samples after the set grew: %v", err)
+	}
+	logged := buf.String()
+	if got := strings.Count(logged, "withholding a role"); got != 2 {
+		t.Errorf("a changed withheld set must re-arm the report, got %d lines; log:\n%s", got, logged)
+	}
+	if !strings.Contains(logged, "web") {
+		t.Errorf("the new victim must be named; log:\n%s", logged)
+	}
+}
+
+// TestWithheldRoleMovesTheGauge pins the half a latched line cannot carry: a
+// standing suppression has to be visible to monitoring, not only in a log line
+// that was printed once.
+func TestWithheldRoleMovesTheGauge(t *testing.T) {
+	var body atomic.Value
+	body.Store(counterExposition("a"))
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte(body.Load().(string)))
+	}))
+	t.Cleanup(srv.Close)
+
+	m := obs.NewWithRegistry(prometheus.NewRegistry())
+	src := newExpositionSource(ExpositionConfig{URL: srv.URL}, slog.Default(), m)
+	targets := []ServiceTarget{{Slug: "api"}}
+
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("first Samples: %v", err)
+	}
+	body.Store(counterExposition("b"))
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("second Samples: %v", err)
+	}
+
+	if got := scrapeMetrics(t, m); !strings.Contains(got, `zensu_monitoring_agent_resource_roles_withheld{role="cpu"} 1`) {
+		t.Errorf("the gauge must report the withheld service; body:\n%s", got)
+	}
+
+	// A peer that repeats its series lets the rate resolve, and the gauge returns.
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("third Samples: %v", err)
+	}
+	if got := scrapeMetrics(t, m); !strings.Contains(got, `zensu_monitoring_agent_resource_roles_withheld{role="cpu"} 0`) {
+		t.Errorf("the gauge must return to zero once the rate resolves; body:\n%s", got)
 	}
 }

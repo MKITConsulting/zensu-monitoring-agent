@@ -39,10 +39,26 @@ type Agent struct {
 	// noneSource rather than substituting a default of its own.
 	source MetricSource
 
-	// warnedSlugs latches the duplicate-slug warning per slug, so a standing
-	// two-namespace misconfiguration costs one line rather than one per tick.
-	warnedSlugs sync.Map
+	// warnedSlugs latches the duplicate-slug warning per slug/workload pair, so a
+	// standing two-namespace misconfiguration costs one line rather than one per
+	// tick. It is bounded: see MaxWarnedSlugPairs. The mutex makes the
+	// check-and-insert one operation, which a Load followed by a Store is not.
+	warnedMu       sync.Mutex
+	warnedSlugs    map[string]struct{}
+	warnedOverflow bool
 }
+
+// MaxWarnedSlugPairs bounds the duplicate-slug latch. Both halves of its key are
+// cluster-controlled, and the setups that misconfigure slugs are the churny ones
+// — preview environments, app-<sha> Deployments, per-PR namespaces — so the
+// growth condition and the churn condition co-occur, inside a process the chart
+// pins to a 56MiB GOMEMLIMIT. The same argument the rate limiter makes about
+// peer-supplied series applies here with the cluster in the peer's role.
+//
+// Past the cap the agent stops recording pairs and says so once. An operator at
+// that point has a systemic annotation problem, and naming the next thousand
+// pairs individually would not help them find it.
+const MaxWarnedSlugPairs = 1024
 
 // New builds an Agent. source must come from NewMetricSource, which owns the
 // selection policy; a nil source disables resource metrics, leaving uptime and
@@ -136,10 +152,28 @@ func (a *Agent) Collect(ctx context.Context) ([]ServiceHeartbeat, error) {
 // the same slug is reported as the new fact it is.
 func (a *Agent) warnDuplicateSlug(slug, reported, shadowed string) {
 	key := slug + "\x1f" + shadowed
-	if _, seen := a.warnedSlugs.Load(key); seen {
+
+	a.warnedMu.Lock()
+	if _, seen := a.warnedSlugs[key]; seen {
+		a.warnedMu.Unlock()
 		return
 	}
-	a.warnedSlugs.Store(key, struct{}{})
+	if len(a.warnedSlugs) >= MaxWarnedSlugPairs {
+		first := !a.warnedOverflow
+		a.warnedOverflow = true
+		a.warnedMu.Unlock()
+		if first {
+			a.log.Warn("too many distinct duplicate service slugs to keep naming them; the zensu.dev/service annotations need fixing at the source",
+				"pairs", MaxWarnedSlugPairs)
+		}
+		return
+	}
+	if a.warnedSlugs == nil {
+		a.warnedSlugs = make(map[string]struct{})
+	}
+	a.warnedSlugs[key] = struct{}{}
+	a.warnedMu.Unlock()
+
 	a.log.Warn("service slug claimed by more than one Deployment; only the first is reported",
 		"slug", slug, "reported", reported, "shadowed", shadowed)
 }

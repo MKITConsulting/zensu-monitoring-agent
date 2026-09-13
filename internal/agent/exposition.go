@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"sort"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -51,11 +53,16 @@ type expositionSource struct {
 	memoryUnresolved atomic.Bool
 	cpuUnrateable    atomic.Bool
 	memoryUnrateable atomic.Bool
-	cpuIncomplete    atomic.Bool
-	memoryIncomplete atomic.Bool
 	cpuAmbiguous     atomic.Bool
 	memoryAmbiguous  atomic.Bool
-	raterFullWarned  atomic.Bool
+	// The withheld-role diagnostic holds the reported SET rather than a flag. A
+	// peer chooses the fingerprints, so it can keep a service withheld for as
+	// long as it likes; a boolean latch clears only on a tick that withholds
+	// nothing, which a standing condition prevents, and would then never report
+	// the next service it adds. Comparing the set re-arms on any change.
+	cpuWithheld     atomic.Pointer[string]
+	memoryWithheld  atomic.Pointer[string]
+	raterFullWarned atomic.Bool
 }
 
 // newExpositionSource builds a MetricSource that scrapes a Prometheus
@@ -279,14 +286,7 @@ func (s *expositionSource) reduce(out map[string][]MetricSample, sel scrape.Sele
 			"metric", sel.Candidate.Name, "role", sel.Role.String(), "pods", sel.Ambiguous)
 	}
 
-	incompleteLatch := s.roleLatch(sel.Role, latchIncomplete)
-	switch {
-	case len(incomplete) == 0:
-		incompleteLatch.Store(false)
-	case !firstObservation && incompleteLatch.CompareAndSwap(false, true):
-		s.log.Warn("withholding a role for services whose pods did not all produce a rate; a partial sum would read as a real measurement",
-			"role", sel.Role.String(), "services", len(incomplete))
-	}
+	s.reportWithheld(sel.Role, sel.Candidate.Name, incomplete, firstObservation)
 
 	for slug := range contributed {
 		if incomplete[slug] {
@@ -316,7 +316,6 @@ type latchKind int
 
 const (
 	latchUnrateable latchKind = iota
-	latchIncomplete
 	latchAmbiguous
 )
 
@@ -326,13 +325,7 @@ const (
 // misconfiguration would warn on every tick.
 func (s *expositionSource) roleLatch(role scrape.Role, kind latchKind) *atomic.Bool {
 	memory := role == scrape.RoleMemory
-	switch kind {
-	case latchIncomplete:
-		if memory {
-			return &s.memoryIncomplete
-		}
-		return &s.cpuIncomplete
-	case latchAmbiguous:
+	if kind == latchAmbiguous {
 		if memory {
 			return &s.memoryAmbiguous
 		}
@@ -342,6 +335,54 @@ func (s *expositionSource) roleLatch(role scrape.Role, kind latchKind) *atomic.B
 		return &s.memoryUnrateable
 	}
 	return &s.cpuUnrateable
+}
+
+// reportWithheld records and reports the services whose role this tick withheld.
+//
+// Withholding is a suppression primitive the scraped peer can drive: it chooses
+// the fingerprints, so a label whose value changes every scrape keeps a service
+// permanently without a predecessor, and a row carrying that service's slug label
+// therefore keeps that service's role permanently withheld. The rule itself is
+// still right — a partial sum would read as a real measurement — so the answer is
+// to make the condition impossible to miss rather than to sum anyway.
+//
+// The slugs are named because they are agent-known values, matched against the
+// annotations the agent discovered, so logging them leaks nothing the operator
+// did not already write. The gauge is set on every tick, first observation
+// included, because a latched line cannot express a condition that persists.
+func (s *expositionSource) reportWithheld(role scrape.Role, metric string, incomplete map[string]bool, firstObservation bool) {
+	slugs := make([]string, 0, len(incomplete))
+	for slug := range incomplete {
+		slugs = append(slugs, slug)
+	}
+	sort.Strings(slugs)
+	s.metrics.SetRolesWithheld(role.String(), len(slugs))
+
+	reported := s.withheldReport(role)
+	if len(slugs) == 0 {
+		reported.Store(nil)
+		return
+	}
+	if firstObservation {
+		return
+	}
+	signature := strings.Join(slugs, ",")
+	if previous := reported.Load(); previous != nil && *previous == signature {
+		return
+	}
+	reported.Store(&signature)
+	s.log.Warn("withholding a role for services whose pods did not all produce a rate; a partial sum would read as a real measurement, and a peer that never repeats a series keeps this standing",
+		"role", role.String(), "metric", metric, "services", slugs)
+}
+
+// withheldReport returns the per-role slot holding the last reported set. Roles
+// are reduced in sequence, so one shared slot would be overwritten by whichever
+// role ran first and the other role would report on every tick.
+func (s *expositionSource) withheldReport(role scrape.Role) *atomic.Pointer[string] {
+	if role == scrape.RoleMemory {
+		return &s.memoryWithheld
+	}
+	return &s.cpuWithheld
 }
 
 // slugIndex resolves an exposition sample to a tracked service slug.
