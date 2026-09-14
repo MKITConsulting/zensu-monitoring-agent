@@ -1,0 +1,12 @@
+# expect: gomemlimit metrics-on scrape-values
+zensu:
+  source: fleet
+agent:
+  mode: deployment
+resourceMetrics:
+  source: exposition
+  scrapeUrl: http://collector.observability:8889/metrics
+  slugLabel: svc
+  cpuMetric: container_cpu_usage
+  memoryMetric: container_memory_rss
+  scrapeTimeout: 5s

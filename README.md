@@ -177,9 +177,12 @@ and `restartCount` still ship.
   yours to add. The scrape sends no authentication, so the exposition is expected to be a
   cluster-internal endpoint; there is no bearer-token or client-certificate option yet, and
   a protected exposition is not supported rather than something to unauthenticate.
-  Userinfo credentials in either URL are refused — see
-  [Configuration](#configuration) for the exact rule. A token carried as a query
-  parameter is NOT detected and would sit in the ConfigMap in clear text. Note also that the agent trusts the scrape target
+  USERINFO credentials in either URL are refused — see
+  [Configuration](#configuration) for the exact rule. That is the only credential
+  shape detected. A token carried in the PATH — `https://collector:8889/api/prom/
+  <tenant>/<token>/metrics`, the shape multi-tenant metric backends actually use —
+  or in the query string is NOT detected, and sits in the ConfigMap in clear text
+  just the same. Note also that the agent trusts the scrape target
   to say which service each measurement belongs to, so a compromised or misconfigured
   collector can misattribute usage. One availability note: the agent buffers a body it
   does not control up to `scrapeMaxBytes` and hands it to the parser whole, so peak
@@ -217,7 +220,7 @@ metadata:
 
 | Env | Required | Default | Description |
 |---|---|---|---|
-| `ZENSU_API_URL` | yes | — | Zensu API base URL. Needs an `http://` or `https://` scheme and a host; userinfo credentials (`https://user:pass@host`) are refused. Both URLs are rendered into a ConfigMap in clear text, so the chart **fails the render** before anything reaches the cluster, and the agent refuses to start as well. |
+| `ZENSU_API_URL` | yes | — | Zensu API base URL. Needs an `http://` or `https://` scheme and a host; userinfo credentials (`https://user:pass@host`) are refused. Both URLs are rendered into a ConfigMap in clear text, so the chart **fails the render** before a userinfo credential reaches the cluster, and the agent refuses to start as well. A credential carried in the path or the query string is not a shape either check recognises. |
 | `ZENSU_API_KEY` | yes | — | API key (`zsk_...`); mint with only the `runtime` scope — see [Trust / security](#trust--security) |
 | `ZENSU_PRODUCT_ID` | yes | — | Product UUID to report to |
 | `ZENSU_MONITORING_AGENT_INTERVAL` | no | `60s` | Heartbeat cadence (Go duration) |

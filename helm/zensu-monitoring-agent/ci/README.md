@@ -28,6 +28,13 @@ Markers:
   than left to the reader.
 - `existing-secret` — the chart creates no Secret of its own and the workload
   reads the operator's.
+- `scrape-values` — every resourceMetrics key renders its configured value.
+  Without it six of the seven keys this feature added are only ever proven to
+  render as `KEY: ""`, which a naming or quoting mistake survives.
+
+The marker vocabulary is closed: the workflow fails a shape carrying a name not
+on this list, because most axes act only on their own marker and a typo would
+otherwise disarm that axis in silence.
 
 Every conditional in `templates/` now has a shape. When you add one, add a shape
 and its marker arm in the workflow in the same pull request.

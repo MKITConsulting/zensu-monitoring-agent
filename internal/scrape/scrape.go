@@ -131,18 +131,33 @@ type Series struct {
 // value.
 func (s Series) Fingerprint() string {
 	keys := make([]string, 0, len(s.Labels))
-	for k := range s.Labels {
+	size := lenPrefixedSize(s.Name)
+	for k, v := range s.Labels {
 		keys = append(keys, k)
+		size += lenPrefixedSize(k) + lenPrefixedSize(v)
 	}
 	sort.Strings(keys)
 
 	var b strings.Builder
+	b.Grow(size)
 	writeLenPrefixed(&b, s.Name)
 	for _, k := range keys {
 		writeLenPrefixed(&b, k)
 		writeLenPrefixed(&b, s.Labels[k])
 	}
 	return b.String()
+}
+
+// lenPrefixedSize is how many bytes writeLenPrefixed will emit for s. It exists
+// so the builder is grown once: this runs on every counter row of every scrape,
+// and an un-presized Builder reallocates as it goes.
+func lenPrefixedSize(s string) int {
+	n := len(s)
+	digits := 1
+	for v := n; v >= 10; v /= 10 {
+		digits++
+	}
+	return digits + 1 + n
 }
 
 func writeLenPrefixed(b *strings.Builder, s string) {

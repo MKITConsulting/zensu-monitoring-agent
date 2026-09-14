@@ -62,10 +62,9 @@ func newExpositionServer(t *testing.T, body string) *expositionServer {
 func newTestExpositionSource(t *testing.T, url string, cfg ExpositionConfig) (*expositionSource, *expositionClock) {
 	t.Helper()
 	cfg.URL = url
-	src := newExpositionSource(cfg, nil, nil)
 	clock := &expositionClock{t: time.Date(2026, 8, 22, 15, 0, 0, 0, time.UTC)}
-	src.rater.Now = clock.now
-	return src, clock
+	cfg.Rater.Now = clock.now
+	return newExpositionSource(cfg, nil, nil), clock
 }
 
 // samplesByKey collapses duplicates, so a test that cares about the count
@@ -204,8 +203,7 @@ container_cpu_usage_seconds_total{pod="api-1",namespace="prod"} 100
 container_cpu_usage_seconds_total{pod="api-2",namespace="prod"} 100
 `
 	srv := newExpositionServer(t, two)
-	src, buf := loggedSource(t, srv.URL, ExpositionConfig{})
-	src.rater.MaxTracked = 1
+	src, buf := loggedSource(t, srv.URL, ExpositionConfig{Rater: scrape.RaterOptions{MaxTracked: 1}})
 	targets := []ServiceTarget{{Slug: "api", Namespace: "prod", PodNames: []string{"api-1", "api-2"}}}
 
 	for i := 0; i < 2; i++ {
@@ -268,8 +266,7 @@ container_cpu_usage_seconds_total{pod="api-1",namespace="prod",container="app"} 
 container_cpu_usage_seconds_total{pod="api-1",namespace="prod",container="sidecar"} 50
 container_cpu_usage_seconds_total{pod="api-1",namespace="prod"} 150
 `)
-	src, _ := newTestExpositionSource(t, srv.URL, ExpositionConfig{})
-	src.rater.MaxTracked = 2
+	src, _ := newTestExpositionSource(t, srv.URL, ExpositionConfig{Rater: scrape.RaterOptions{MaxTracked: 2}})
 	targets := []ServiceTarget{{Slug: "api", Namespace: "prod", PodNames: []string{"api-1"}}}
 
 	if _, err := src.Samples(context.Background(), targets); err != nil {
@@ -851,8 +848,9 @@ container_memory_working_set_bytes{pod="api-1",namespace="prod",container="app"}
 container_memory_working_set_bytes{pod="api-1",namespace="prod"} 999
 container_memory_working_set_bytes{pod="ghost-1",namespace="prod"} 7
 `)
-	src, buf := debugSource(t, srv.URL, ExpositionConfig{})
-	src.rater.Now = (&expositionClock{t: time.Date(2026, 8, 22, 15, 0, 0, 0, time.UTC)}).now
+	src, buf := debugSource(t, srv.URL, ExpositionConfig{Rater: scrape.RaterOptions{
+		Now: (&expositionClock{t: time.Date(2026, 8, 22, 15, 0, 0, 0, time.UTC)}).now,
+	}})
 	targets := []ServiceTarget{{Slug: "api", Namespace: "prod", PodNames: []string{"api-1"}}}
 
 	if _, err := src.Samples(context.Background(), targets); err != nil {
@@ -1013,9 +1011,8 @@ func TestExpositionSourceWarnsOnWithheldService(t *testing.T) {
 	srv := newExpositionServer(t, `# TYPE container_cpu_usage_seconds_total counter
 container_cpu_usage_seconds_total{pod="api-1",namespace="prod"} 100
 `)
-	src, buf := loggedSource(t, srv.URL, ExpositionConfig{})
 	clock := &expositionClock{t: time.Date(2026, 8, 22, 15, 0, 0, 0, time.UTC)}
-	src.rater.Now = clock.now
+	src, buf := loggedSource(t, srv.URL, ExpositionConfig{Rater: scrape.RaterOptions{Now: clock.now}})
 	targets := []ServiceTarget{{Slug: "api", Namespace: "prod", PodNames: []string{"api-1", "api-2"}}}
 
 	if _, err := src.Samples(context.Background(), targets); err != nil {
@@ -1092,8 +1089,9 @@ func TestExpositionSourceSuppressesWithheldWarningOnFirstTick(t *testing.T) {
 	srv := newExpositionServer(t, `# TYPE container_cpu_usage_seconds_total counter
 container_cpu_usage_seconds_total{pod="api-1",namespace="prod"} 100
 `)
-	src, buf := loggedSource(t, srv.URL, ExpositionConfig{})
-	src.rater.Now = (&expositionClock{t: time.Date(2026, 8, 22, 15, 0, 0, 0, time.UTC)}).now
+	src, buf := loggedSource(t, srv.URL, ExpositionConfig{Rater: scrape.RaterOptions{
+		Now: (&expositionClock{t: time.Date(2026, 8, 22, 15, 0, 0, 0, time.UTC)}).now,
+	}})
 	targets := []ServiceTarget{{Slug: "api", Namespace: "prod", PodNames: []string{"api-1", "api-2"}}}
 
 	if _, err := src.Samples(context.Background(), targets); err != nil {

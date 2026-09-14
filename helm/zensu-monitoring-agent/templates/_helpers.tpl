@@ -63,6 +63,18 @@ configurations. Emitters below stay pure.
 {{- if not (regexMatch "^[0-9]+$" .) }}
 {{- fail (printf "resourceMetrics.scrapeMaxBytes %q is not a plain byte count; the agent parses it with ParseInt and would silently fall back to its own default" .) }}
 {{- end }}
+{{/*
+The two values readLimit discards are refused here rather than accepted and
+dropped: zero means unset to the binary, and anything above the absolute ceiling
+falls back to the default, so both leave an operator with a cap they did not ask
+for and no message saying so.
+*/}}
+{{- if eq (int64 .) 0 }}
+{{- fail "resourceMetrics.scrapeMaxBytes 0 means unset to the agent, which then applies its own default; leave it empty to say that, or give a real byte count" }}
+{{- end }}
+{{- if gt (int64 .) 16777216 }}
+{{- fail (printf "resourceMetrics.scrapeMaxBytes %s is above the agent's absolute ceiling of 16777216, which makes it fall back to the 8 MiB default; lower it, and raise agent.goMemLimit with it" .) }}
+{{- end }}
 {{- end }}
 {{- with (include "zensu-monitoring-agent.goMemLimit" .) }}
 {{- if not (regexMatch "^[0-9]*[1-9][0-9]*(B|KiB|MiB|GiB|TiB)?$" .) }}
@@ -79,6 +91,18 @@ says, because the ConfigMap key is written in every mode.
 */}}
 {{- range $name, $url := dict "zensu.apiUrl" .Values.zensu.apiUrl "resourceMetrics.scrapeUrl" .Values.resourceMetrics.scrapeUrl }}
 {{- if $url }}
+{{/*
+Control characters and whitespace are refused BEFORE the userinfo rule, because
+that rule is positional and this one is not. "[^/?#]*" cannot reach an "@" past a
+slash, so a multi-line value whose first line is innocent passes both rules and
+renders the credential on its second line into the ConfigMap; url.Parse then
+rejects the control character at startup, which is after the release already
+holds it. The chart has to be the strict side here, not the permissive one: it
+runs first.
+*/}}
+{{- if regexMatch "[[:space:][:cntrl:]]" (toString $url) }}
+{{- fail (printf "%s contains whitespace or a control character; the chart refuses it rather than letting a positional rule below miss a credential on a later line" $name) }}
+{{- end }}
 {{- if regexMatch "^[a-zA-Z][a-zA-Z0-9+.-]*://[^/?#]*@" (toString $url) }}
 {{- fail (printf "%s carries credentials in its userinfo, which are unsupported and would be stored in a ConfigMap in clear text; put the credential behind a proxy or a Secret-backed header instead" $name) }}
 {{- end }}
@@ -89,6 +113,17 @@ says, because the ConfigMap key is written in every mode.
 {{- end }}
 {{- if and .Values.rbac.create (not .Values.serviceAccount.create) (not .Values.serviceAccount.name) }}
 {{- fail "rbac.create with serviceAccount.create=false and no serviceAccount.name would bind the cluster-wide read ClusterRole to the namespace's \"default\" ServiceAccount, granting it to every workload in the namespace that uses it; set serviceAccount.name to the account the agent actually runs as, or leave serviceAccount.create enabled" }}
+{{- end }}
+{{- if not (has (toString .Values.resourceMetrics.source) (list "" "auto" "metrics-server" "exposition" "none")) }}
+{{- fail (printf "resourceMetrics.source %q is not one of auto, metrics-server, exposition or none; the render would succeed and the agent would exit 1 at startup" (toString .Values.resourceMetrics.source)) }}
+{{- end }}
+{{- with (toString .Values.resourceMetrics.scrapeTimeout) }}
+{{- if and (ne . "") (not (regexMatch "^[0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h)$" .)) }}
+{{- fail (printf "resourceMetrics.scrapeTimeout %q is not a Go duration; ParseDuration would reject it and the agent would silently fall back to its own default" .) }}
+{{- end }}
+{{- end }}
+{{- if le (int .Values.agent.intervalSeconds) 0 }}
+{{- fail (printf "agent.intervalSeconds %v is not positive; the binary would silently substitute its own default rather than honour it" .Values.agent.intervalSeconds) }}
 {{- end }}
 {{- if .Values.metrics.networkPolicy.enabled }}
 {{- if not .Values.metrics.networkPolicy.from }}

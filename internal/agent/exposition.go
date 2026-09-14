@@ -34,6 +34,11 @@ type ExpositionConfig struct {
 	// configurable so an operator hitting the agent's memory limit can lower it
 	// without waiting for a release.
 	MaxBytes int64
+	// Rater replaces the rate tracker's clock and ceiling. No env var or chart key
+	// reaches it: it exists so a test can drive both without the Rater carrying
+	// exported knobs, one of which would let any caller raise the very ceiling
+	// that bounds what a peer can make the agent retain.
+	Rater scrape.RaterOptions
 }
 
 type expositionSource struct {
@@ -91,7 +96,7 @@ func newExpositionSource(cfg ExpositionConfig, log *slog.Logger, metrics *obs.Me
 	}
 	return &expositionSource{
 		client:    client,
-		rater:     scrape.NewRater(),
+		rater:     scrape.NewRater(cfg.Rater),
 		resolver:  scrape.Resolver{CPUOverride: cfg.CPUMetric, MemoryOverride: cfg.MemoryMetric},
 		slugLabel: slugLabel,
 		log:       log,
@@ -206,10 +211,7 @@ func (s *expositionSource) rateCounters(selections []scrape.Selection) map[strin
 		return nil
 	}
 
-	rated := make(map[string]float64, len(counters))
-	for _, r := range s.rater.Observe(counters) {
-		rated[r.Fingerprint()] = r.Value
-	}
+	rated := s.rater.Observe(counters)
 	if s.rater.RefusedSeries() {
 		if s.raterFullWarned.CompareAndSwap(false, true) {
 			s.log.Warn("exposition carries more counter series than the agent will track; some rates will be missing",

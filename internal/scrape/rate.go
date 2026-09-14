@@ -21,19 +21,36 @@ const MaxTrackedSeries = 20_000
 // It is NOT safe for concurrent use: Observe rebuilds an unsynchronized map. One
 // caller per Rater, which is what a single heartbeat loop gives it.
 type Rater struct {
-	// Now is injectable for tests; nil means time.Now.
-	Now func() time.Time
-
-	// MaxTracked overrides MaxTrackedSeries; zero uses the constant.
-	MaxTracked int
-
-	prev    map[string]observation
-	refused bool
+	now        func() time.Time
+	maxTracked int
+	prev       map[string]observation
+	refused    bool
 }
 
-// NewRater builds an empty Rater backed by the wall clock.
-func NewRater() *Rater {
-	return &Rater{prev: map[string]observation{}}
+// RaterOptions configures a Rater at construction. Both fields exist so a caller
+// can inject them once; neither is a field on Rater, because MaxTrackedSeries is
+// the ceiling the doc comment promises against a peer that chooses how many
+// series it sends, and an exported knob would let any caller raise exactly that.
+type RaterOptions struct {
+	// Now replaces the wall clock. Nil uses time.Now.
+	Now func() time.Time
+	// MaxTracked replaces MaxTrackedSeries. Non-positive uses the constant.
+	MaxTracked int
+}
+
+// NewRater builds an empty Rater backed by the wall clock and the package
+// ceiling. Pass options to replace either.
+func NewRater(opts ...RaterOptions) *Rater {
+	r := &Rater{prev: map[string]observation{}}
+	for _, o := range opts {
+		if o.Now != nil {
+			r.now = o.Now
+		}
+		if o.MaxTracked > 0 {
+			r.maxTracked = o.MaxTracked
+		}
+	}
+	return r
 }
 
 // RefusedSeries reports whether the last Observe hit the tracking ceiling. The
@@ -56,14 +73,14 @@ func (r *Rater) RefusedSeries() bool { return r.refused }
 // peer's whole series count, making the exposition's size the bound rather than
 // ours. Established series still take precedence: they fill the table first, so
 // a burst of new fingerprints cannot displace the ones actually reporting.
-func (r *Rater) Observe(series []Series) []Series {
+func (r *Rater) Observe(series []Series) map[string]float64 {
 	now := time.Now
-	if r.Now != nil {
-		now = r.Now
+	if r.now != nil {
+		now = r.now
 	}
 	at := now()
 
-	ceiling := r.MaxTracked
+	ceiling := r.maxTracked
 	if ceiling <= 0 {
 		ceiling = MaxTrackedSeries
 	}
@@ -78,7 +95,7 @@ func (r *Rater) Observe(series []Series) []Series {
 		size = ceiling
 	}
 	next := make(map[string]observation, size)
-	out := make([]Series, 0, size)
+	out := make(map[string]float64, size)
 	r.refused = false
 
 	for i, s := range series {
@@ -114,10 +131,7 @@ func (r *Rater) Observe(series []Series) []Series {
 			continue
 		}
 
-		rated := s
-		rated.Value = (s.Value - prev.value) / elapsed
-		rated.Kind = KindGauge
-		out = append(out, rated)
+		out[fps[i]] = (s.Value - prev.value) / elapsed
 	}
 
 	r.prev = next
