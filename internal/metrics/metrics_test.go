@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -94,14 +95,31 @@ func TestSetServicesReported(t *testing.T) {
 	}
 }
 
+// TestNilMetricsAreNoOp pins the contract that EVERY method on *Metrics is safe
+// on a nil receiver, because metrics.enabled=false is a shipped configuration
+// that leaves the pointer nil — a dropped guard panics a supported deployment
+// rather than degrading it. The method set is walked by reflection rather than
+// listed, so a method added without a guard fails here the day it lands; a
+// hand-written list would only cover what someone remembered to add to it.
 func TestNilMetricsAreNoOp(t *testing.T) {
 	var m *Metrics
-	m.RecordHeartbeat(true, time.Second)
-	m.RecordHeartbeat(false, time.Second)
-	m.SetServicesReported(3)
-	m.RecordScrape(true, time.Second)
-	m.RecordScrape(false, time.Second)
-	m.SetResourceServicesMapped(3)
+	nilValue := reflect.ValueOf(m)
+	for i := range nilValue.NumMethod() {
+		method := nilValue.Type().Method(i)
+		args := make([]reflect.Value, method.Type.NumIn()-1)
+		for j := range args {
+			args[j] = reflect.New(method.Type.In(j + 1)).Elem()
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("nil %s panicked: %v — every method needs its own nil guard", method.Name, r)
+				}
+			}()
+			nilValue.Method(i).Call(args)
+		}()
+	}
+
 	if err := m.Serve(context.Background(), ":2112"); err != nil {
 		t.Errorf("nil Serve = %v, want nil", err)
 	}

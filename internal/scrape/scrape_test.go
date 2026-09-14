@@ -674,3 +674,26 @@ func TestScalarOfRejectsAggregateTypes(t *testing.T) {
 		t.Error("a histogram metric has no scalar value")
 	}
 }
+
+// TestLenPrefixedSizeMatchesWhatIsWritten pins the presize against the writer it
+// exists for. An undersized estimate only costs a reallocation, but an oversized
+// one silently inflates every fingerprint buffer on the hot path, and nothing
+// else compares the two.
+func TestLenPrefixedSizeMatchesWhatIsWritten(t *testing.T) {
+	for _, s := range []string{
+		"",
+		"a",
+		strings.Repeat("x", 9),
+		strings.Repeat("x", 10),
+		strings.Repeat("x", 99),
+		strings.Repeat("x", 100),
+		strings.Repeat("x", 1234),
+	} {
+		var b strings.Builder
+		writeLenPrefixed(&b, s)
+		if got, want := lenPrefixedSize(s), b.Len(); got != want {
+			t.Errorf("lenPrefixedSize(len %d) = %d, want %d — the estimate must equal what writeLenPrefixed emits",
+				len(s), got, want)
+		}
+	}
+}
