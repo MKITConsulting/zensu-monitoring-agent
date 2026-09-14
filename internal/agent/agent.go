@@ -131,6 +131,7 @@ func (a *Agent) Collect(ctx context.Context) ([]ServiceHeartbeat, error) {
 
 	samples := a.collectSamples(ctx, targets)
 	mapped := 0
+	perRole := map[string]int{}
 	for i := range out {
 		ms, ok := samples[out[i].Slug]
 		if !ok || len(ms) == 0 {
@@ -138,8 +139,14 @@ func (a *Agent) Collect(ctx context.Context) ([]ServiceHeartbeat, error) {
 		}
 		out[i].Metrics = append(out[i].Metrics, ms...)
 		mapped++
+		for _, m := range ms {
+			perRole[m.Key]++
+		}
 	}
 	a.Metrics.SetResourceServicesMapped(mapped)
+	a.Metrics.SetResourceSamples("cpu", perRole[MetricCPUMillicores])
+	a.Metrics.SetResourceSamples("memory", perRole[MetricMemoryBytes])
+	a.Metrics.SetResourceSource(a.source.Name())
 	return out, nil
 }
 

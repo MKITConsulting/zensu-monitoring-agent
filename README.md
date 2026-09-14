@@ -125,10 +125,21 @@ processors:
 Without that label the agent falls back to matching the sample's `pod`/`k8s_pod_name` and
 `namespace`/`k8s_namespace_name` labels against the Pods it already discovered, which
 works with no collector configuration at all but cannot resolve a pod name that is
-ambiguous across namespaces. Samples that match no tracked service are dropped. Watch
-`zensu_monitoring_agent_resource_services_mapped` on the agent's own `/metrics`: a
-successful scrape with zero mapped services means the attribution, not the scrape, is
-what needs fixing.
+ambiguous across namespaces. Samples that match no tracked service are dropped, and a
+metric whose rows ALL drop is reported at warn — that is a projection failure rather
+than a collector that merely also covers untracked workloads.
+
+Watch `zensu_monitoring_agent_resource_samples{role}` on the agent's own `/metrics`: it
+counts the services that received each role, so a loss that costs only CPU or only
+memory is visible. `resource_services_mapped` counts services rather than roles, so it
+still reads healthy while half the data is missing — a successful scrape with zero
+mapped services means attribution rather than the scrape needs fixing, but a non-zero
+one proves nothing about either role on its own. `resource_source{source}` names the
+source that actually served the last tick, which `scrape_total` cannot: that counter is
+pre-initialised in modes that never scrape, so a zero rate reads the same on a healthy
+metrics-server tick as on an exposition that stopped. For the two row-level diagnostics
+— which rows the row policy removed, which mapped to nothing — set `agent.logLevel:
+debug`.
 
 **Graceful degrade applies to every source.** A failed scrape, an unreachable collector,
 or an exposition without any known metric costs the metrics for that tick only — status
@@ -270,6 +281,9 @@ Exposed series (plus the standard `go_*` / `process_*` collectors):
 | `zensu_monitoring_agent_scrape_total{result="success\|error"}` | counter | Collector-exposition scrapes by outcome (exposition source only) |
 | `zensu_monitoring_agent_scrape_duration_seconds` | histogram | Collector-exposition scrape latency |
 | `zensu_monitoring_agent_resource_services_mapped` | gauge | Services that received CPU/memory in the last tick, whatever the source |
+| `zensu_monitoring_agent_resource_samples{role="cpu\|memory"}` | gauge | Services that received THIS role in the last tick — the one that sees a per-role loss |
+| `zensu_monitoring_agent_resource_roles_withheld{role="cpu\|memory"}` | gauge | Services whose role was withheld because not all of their rows produced a rate |
+| `zensu_monitoring_agent_resource_source{source="metrics-server\|exposition\|none"}` | gauge | 1 for the source in use in the last tick, 0 for the others |
 
 Enable scraping one of two ways:
 

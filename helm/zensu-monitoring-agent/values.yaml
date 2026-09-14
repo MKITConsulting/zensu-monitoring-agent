@@ -17,6 +17,12 @@ zensu:
   source: k8s-agent
 
 agent:
+  # Minimum log level: debug, info, warn or error. Empty uses info. Raise it to
+  # debug to see which exposition rows the row policy removed and which mapped to
+  # no tracked service — the two diagnostics for an attribution problem. An
+  # unreadable value falls back to info rather than crash-looping the pod over a
+  # logging preference.
+  logLevel: ""
   # deployment = long-running ticker; cronjob = one-shot per schedule (--once)
   mode: deployment
   intervalSeconds: 60

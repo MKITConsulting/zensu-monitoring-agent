@@ -55,6 +55,8 @@ type expositionSource struct {
 	memoryUnrateable atomic.Bool
 	cpuAmbiguous     atomic.Bool
 	memoryAmbiguous  atomic.Bool
+	cpuAllDropped    atomic.Bool
+	memoryAllDropped atomic.Bool
 	// The withheld-role diagnostic holds the reported SET rather than a flag. A
 	// peer chooses the fingerprints, so it can keep a service withheld for as
 	// long as it likes; a boolean latch clears only on a tick that withholds
@@ -268,9 +270,21 @@ func (s *expositionSource) reduce(out map[string][]MetricSample, sel scrape.Sele
 		contributed[slug] = true
 	}
 
-	if dropped > 0 {
-		s.log.Debug("dropped exposition rows that map to no tracked service",
-			"metric", sel.Candidate.Name, "rows", dropped)
+	allDropped := s.roleLatch(sel.Role, latchAllDropped)
+	switch {
+	case dropped == 0 || len(contributed) > 0:
+		allDropped.Store(false)
+		if dropped > 0 {
+			s.log.Debug("dropped exposition rows that map to no tracked service",
+				"metric", sel.Candidate.Name, "rows", dropped)
+		}
+	case allDropped.CompareAndSwap(false, true):
+		// Every row was discarded and none contributed, which is a broken slug
+		// projection rather than the benign case of a collector that also covers
+		// workloads Zensu does not track. Those two look identical at Debug, and
+		// Debug is not emitted by any shipped build.
+		s.log.Warn("every row of this metric mapped to no tracked service; the slug label or the pod/namespace labels are not reaching the agent",
+			"metric", sel.Candidate.Name, "role", sel.Role.String(), "rows", dropped, "slugLabel", s.slugLabel)
 	}
 	if sel.Excluded > 0 {
 		s.log.Debug("excluded exposition rows as pod-level rollups or pause containers",
@@ -317,6 +331,7 @@ type latchKind int
 const (
 	latchUnrateable latchKind = iota
 	latchAmbiguous
+	latchAllDropped
 )
 
 // roleLatch returns the latch for one role and condition. Latches are per role
@@ -325,11 +340,17 @@ const (
 // misconfiguration would warn on every tick.
 func (s *expositionSource) roleLatch(role scrape.Role, kind latchKind) *atomic.Bool {
 	memory := role == scrape.RoleMemory
-	if kind == latchAmbiguous {
+	switch kind {
+	case latchAmbiguous:
 		if memory {
 			return &s.memoryAmbiguous
 		}
 		return &s.cpuAmbiguous
+	case latchAllDropped:
+		if memory {
+			return &s.memoryAllDropped
+		}
+		return &s.cpuAllDropped
 	}
 	if memory {
 		return &s.memoryUnrateable

@@ -25,7 +25,20 @@ type Metrics struct {
 	scrapeDuration         prometheus.Histogram
 	resourceServicesMapped prometheus.Gauge
 	rolesWithheld          *prometheus.GaugeVec
+	resourceSamples        *prometheus.GaugeVec
+	resourceSource         *prometheus.GaugeVec
 }
+
+// ResourceRoles are the per-role gauge labels. Both are pre-initialised so a
+// role that never reports reads as 0 rather than as an absent series, which a
+// rate() or a threshold alert cannot distinguish from a healthy quiet one.
+var ResourceRoles = []string{"cpu", "memory"}
+
+// ResourceSources are the source names resourceSource may carry. Listing them
+// keeps every label pre-initialised, so "which source is this pod on" is
+// answerable from one scrape rather than by waiting for the active one to
+// appear.
+var ResourceSources = []string{"metrics-server", "exposition", "none"}
 
 func New() *Metrics {
 	return NewWithRegistry(prometheus.NewRegistry())
@@ -68,17 +81,31 @@ func NewWithRegistry(reg *prometheus.Registry) *Metrics {
 			Name: "zensu_monitoring_agent_resource_roles_withheld",
 			Help: "Number of services whose role was withheld in the last tick because not all of their rows produced a rate.",
 		}, []string{"role"}),
+		resourceSamples: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "zensu_monitoring_agent_resource_samples",
+			Help: "Number of services that received this resource role in the last tick.",
+		}, []string{"role"}),
+		resourceSource: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "zensu_monitoring_agent_resource_source",
+			Help: "1 for the resource source in use in the last tick, 0 for the others.",
+		}, []string{"source"}),
 	}
 	reg.MustRegister(m.heartbeats, m.lastSuccess, m.postDuration, m.servicesReported)
 	reg.MustRegister(m.scrapes, m.scrapeDuration, m.resourceServicesMapped, m.rolesWithheld)
+	reg.MustRegister(m.resourceSamples, m.resourceSource)
 	reg.MustRegister(collectors.NewGoCollector())
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	m.heartbeats.WithLabelValues("success")
 	m.heartbeats.WithLabelValues("error")
 	m.scrapes.WithLabelValues("success")
 	m.scrapes.WithLabelValues("error")
-	m.rolesWithheld.WithLabelValues("cpu")
-	m.rolesWithheld.WithLabelValues("memory")
+	for _, role := range ResourceRoles {
+		m.rolesWithheld.WithLabelValues(role)
+		m.resourceSamples.WithLabelValues(role)
+	}
+	for _, source := range ResourceSources {
+		m.resourceSource.WithLabelValues(source)
+	}
 	return m
 }
 
@@ -123,6 +150,36 @@ func (m *Metrics) SetResourceServicesMapped(n int) {
 		return
 	}
 	m.resourceServicesMapped.Set(float64(n))
+}
+
+// SetResourceSamples records how many services received one resource role. It is
+// per role because every failure mode this agent has is per role — a cumulative
+// memory family that cannot be rated, a CPU role withheld for a service, a role
+// that resolves to nothing — and in each the other role still reports, so a
+// service-granular count reads as healthy while half the data is missing.
+func (m *Metrics) SetResourceSamples(role string, n int) {
+	if m == nil {
+		return
+	}
+	m.resourceSamples.WithLabelValues(role).Set(float64(n))
+}
+
+// SetResourceSource records which source served the last tick, as 1 for that one
+// and 0 for the rest. Without it the source in use is not observable at all on a
+// pod that has been running for a week, and scrape_total cannot answer it: the
+// counter is pre-initialised in modes that never scrape, so a zero rate reads the
+// same as a healthy metrics-server tick and as an exposition that stopped.
+func (m *Metrics) SetResourceSource(active string) {
+	if m == nil {
+		return
+	}
+	for _, source := range ResourceSources {
+		value := 0.0
+		if source == active {
+			value = 1
+		}
+		m.resourceSource.WithLabelValues(source).Set(value)
+	}
 }
 
 // SetRolesWithheld records how many services had this role withheld. It is the

@@ -113,3 +113,79 @@ func TestTickSetsServicesReported(t *testing.T) {
 		t.Errorf("services_reported should be 1 after a 1-service tick; body:\n%s", body)
 	}
 }
+
+// roleSource serves a fixed sample set, so a tick can be made to deliver one
+// role and not the other.
+type roleSource struct {
+	name    string
+	samples []MetricSample
+}
+
+func (r *roleSource) Name() string { return r.name }
+
+func (r *roleSource) Samples(_ context.Context, targets []ServiceTarget) (map[string][]MetricSample, error) {
+	out := map[string][]MetricSample{}
+	for _, t := range targets {
+		out[t.Slug] = r.samples
+	}
+	return out, nil
+}
+
+// TestResourceSamplesAreRoleGranular pins the gauge that makes a per-role loss
+// visible. Every failure mode this feature has is per role, and in each the other
+// role still reports — so resource_services_mapped does not move, and a
+// service-granular count reads healthy while half the data is gone.
+func TestResourceSamplesAreRoleGranular(t *testing.T) {
+	client := fake.NewSimpleClientset(deployment("default", "api", "api", 1, 1))
+	m := obs.NewWithRegistry(prometheus.NewRegistry())
+	src := &roleSource{name: SourceExposition, samples: []MetricSample{
+		{Key: MetricMemoryBytes, Value: 1000},
+	}}
+	a := New(Config{ProductID: "p", Namespaces: []string{"default"}},
+		NewClientsetLister(client, nil), &stubReporter{}, nil, src)
+	a.Metrics = m
+
+	if _, err := a.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	body := scrapeMetrics(t, m)
+	if !strings.Contains(body, `zensu_monitoring_agent_resource_samples{role="memory"} 1`) {
+		t.Errorf("memory role must report 1; body:\n%s", body)
+	}
+	if !strings.Contains(body, `zensu_monitoring_agent_resource_samples{role="cpu"} 0`) {
+		t.Errorf("the missing CPU role must read 0, not be absent; body:\n%s", body)
+	}
+	// The service-granular gauge cannot see this loss, which is the point.
+	if !strings.Contains(body, "zensu_monitoring_agent_resource_services_mapped 1") {
+		t.Errorf("mapped must still read 1, showing why it is not enough; body:\n%s", body)
+	}
+}
+
+// TestResourceSourceNamesTheActiveSource pins that the source in use is readable
+// from one scrape. Without it a week-old pod cannot be asked which source it is
+// on, and scrape_total cannot answer: it is pre-initialised in modes that never
+// scrape, so a zero rate reads the same as a healthy tick and as a stopped
+// exposition.
+func TestResourceSourceNamesTheActiveSource(t *testing.T) {
+	client := fake.NewSimpleClientset(deployment("default", "api", "api", 1, 1))
+	m := obs.NewWithRegistry(prometheus.NewRegistry())
+	a := New(Config{ProductID: "p", Namespaces: []string{"default"}},
+		NewClientsetLister(client, nil), &stubReporter{}, nil,
+		&roleSource{name: SourceExposition})
+	a.Metrics = m
+
+	if _, err := a.Collect(context.Background()); err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+
+	body := scrapeMetrics(t, m)
+	if !strings.Contains(body, `zensu_monitoring_agent_resource_source{source="exposition"} 1`) {
+		t.Errorf("the active source must read 1; body:\n%s", body)
+	}
+	for _, other := range []string{"metrics-server", "none"} {
+		if !strings.Contains(body, `zensu_monitoring_agent_resource_source{source="`+other+`"} 0`) {
+			t.Errorf("inactive source %q must read 0 rather than be absent; body:\n%s", other, body)
+		}
+	}
+}

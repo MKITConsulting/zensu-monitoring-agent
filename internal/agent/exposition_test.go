@@ -1337,3 +1337,56 @@ func TestWithheldRoleMovesTheGauge(t *testing.T) {
 		t.Errorf("the gauge must return to zero once the rate resolves; body:\n%s", got)
 	}
 }
+
+// TestExpositionSourceWarnsWhenEveryRowIsDropped pins the diagnostic for a broken
+// slug projection. Before, it was a Debug line identical in level and shape to
+// the entirely benign case of a collector that also covers workloads Zensu does
+// not track — and no shipped build emits Debug, so it was unreachable either way.
+func TestExpositionSourceWarnsWhenEveryRowIsDropped(t *testing.T) {
+	srv := newExpositionServer(t, `# TYPE k8s_pod_memory_working_set_bytes gauge
+k8s_pod_memory_working_set_bytes{pod="ghost-1",namespace="other"} 500
+`)
+	src, buf := loggedSource(t, srv.URL, ExpositionConfig{})
+	targets := []ServiceTarget{{Slug: "api", Namespace: "prod", PodNames: []string{"api-1"}}}
+
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("Samples: %v", err)
+	}
+	logged := buf.String()
+	if !strings.Contains(logged, "every row of this metric mapped to no tracked service") {
+		t.Fatalf("a fully unattributed metric must be reported at warn; log:\n%s", logged)
+	}
+	// The candidate name, not the exposition's suffixed spelling: that is what the
+	// agent matched on, and it is what every other diagnostic in this file logs.
+	if !strings.Contains(logged, "metric=k8s_pod_memory_working_set ") {
+		t.Errorf("the warning must name the metric; log:\n%s", logged)
+	}
+	if !strings.Contains(logged, DefaultSlugLabel) {
+		t.Errorf("the warning must name the slug label the operator has to project; log:\n%s", logged)
+	}
+
+	if _, err := src.Samples(context.Background(), targets); err != nil {
+		t.Fatalf("second Samples: %v", err)
+	}
+	if got := strings.Count(buf.String(), "every row of this metric mapped"); got != 1 {
+		t.Errorf("a standing projection failure must cost one line, got %d", got)
+	}
+}
+
+// TestExpositionSourceStaysQuietWhenSomeRowsAttribute is the negative half: a
+// collector covering workloads Zensu does not track is the expected case, and
+// promoting it to warn would make the diagnostic above worthless.
+func TestExpositionSourceStaysQuietWhenSomeRowsAttribute(t *testing.T) {
+	srv := newExpositionServer(t, `# TYPE k8s_pod_memory_working_set_bytes gauge
+k8s_pod_memory_working_set_bytes{zensu_service="api"} 500
+k8s_pod_memory_working_set_bytes{pod="ghost-1",namespace="other"} 500
+`)
+	src, buf := loggedSource(t, srv.URL, ExpositionConfig{})
+
+	if _, err := src.Samples(context.Background(), []ServiceTarget{{Slug: "api"}}); err != nil {
+		t.Fatalf("Samples: %v", err)
+	}
+	if strings.Contains(buf.String(), "every row of this metric mapped") {
+		t.Errorf("a partially attributed metric is the expected case; log:\n%s", buf.String())
+	}
+}

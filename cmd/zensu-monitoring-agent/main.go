@@ -29,7 +29,7 @@ func main() {
 	once := flag.Bool("once", false, "run a single heartbeat then exit (for a CronJob or host cron)")
 	flag.Parse()
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: envLogLevel()}))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -103,6 +103,28 @@ func run(ctx context.Context, log *slog.Logger, once bool, newLister func() (age
 		return err
 	}
 	return nil
+}
+
+// envLogLevel resolves the handler's minimum level. Several diagnostics — which
+// rows the row policy removed, which rows mapped to no service — are only useful
+// while an operator is debugging an attribution problem, so they are logged at
+// Debug. Without this they could not be turned on at all: a nil HandlerOptions
+// means slog's Info default, and no chart key reached it, so the lines existed
+// only for the tests that build their own handler.
+//
+// An unreadable value falls back to Info rather than refusing to start. The agent
+// would otherwise crash-loop over a logging preference, and losing the heartbeat
+// is worse than logging at the wrong level.
+func envLogLevel() slog.Level {
+	var level slog.Level
+	raw := os.Getenv("ZENSU_MONITORING_AGENT_LOG_LEVEL")
+	if raw == "" {
+		return slog.LevelInfo
+	}
+	if err := level.UnmarshalText([]byte(raw)); err != nil {
+		return slog.LevelInfo
+	}
+	return level
 }
 
 // requiredConfig holds the startup refusals main() would otherwise inline, where

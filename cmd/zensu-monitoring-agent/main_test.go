@@ -392,3 +392,28 @@ func TestEnvBool(t *testing.T) {
 		})
 	}
 }
+
+// TestEnvLogLevel pins that the Debug diagnostics can be turned on at all, and
+// that a typo does not crash-loop the pod over a logging preference.
+func TestEnvLogLevel(t *testing.T) {
+	cases := []struct {
+		name string
+		val  string
+		want slog.Level
+	}{
+		{"unset", "", slog.LevelInfo},
+		{"debug", "debug", slog.LevelDebug},
+		{"upper case", "DEBUG", slog.LevelDebug},
+		{"warn", "warn", slog.LevelWarn},
+		{"error", "error", slog.LevelError},
+		{"unreadable falls back rather than refusing to start", "chatty", slog.LevelInfo},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("ZENSU_MONITORING_AGENT_LOG_LEVEL", c.val)
+			if got := envLogLevel(); got != c.want {
+				t.Errorf("envLogLevel() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
