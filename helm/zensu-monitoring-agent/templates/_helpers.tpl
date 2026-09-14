@@ -136,10 +136,50 @@ cannot reach the threshold, and the interval is rendered through printf "%ds".
 {{- end -}}
 {{- end }}
 
+{{/*
+memoryLimitBytes renders resources.limits.memory as a plain byte count, or the
+empty string when no limit is set. Kubernetes quantities are not Go byte counts,
+so the suffix is resolved here rather than handed to a runtime that would reject
+it. A limit the chart cannot read fails the render instead of silently producing
+no ceiling: the operator asked for a derived value, and quietly not deriving one
+is the shape this chart refuses everywhere else.
+*/}}
+{{- define "zensu-monitoring-agent.memoryLimitBytes" -}}
+{{- $m := "" -}}
+{{- if .Values.resources -}}{{- if .Values.resources.limits -}}{{- $m = .Values.resources.limits.memory -}}{{- end -}}{{- end -}}
+{{- $raw := "" -}}
+{{- if kindIs "invalid" $m -}}
+{{- else if kindIs "float64" $m -}}{{- $raw = printf "%.0f" $m -}}
+{{- else -}}{{- $raw = toString $m -}}
+{{- end -}}
+{{- if $raw -}}
+{{- $n := regexFind "^[0-9]+" $raw -}}
+{{- if not $n -}}
+{{- fail (printf "agent.goMemLimit is auto, but resources.limits.memory %q is not a byte quantity the chart can read; set agent.goMemLimit to an explicit value instead" $raw) }}
+{{- end -}}
+{{- $b := atoi $n -}}
+{{- $unit := regexReplaceAll "^[0-9]+" $raw "" -}}
+{{- if eq $unit "" -}}{{ $b }}
+{{- else if eq $unit "Ki" -}}{{ mul $b 1024 }}
+{{- else if eq $unit "Mi" -}}{{ mul $b 1048576 }}
+{{- else if eq $unit "Gi" -}}{{ mul $b 1073741824 }}
+{{- else if eq $unit "Ti" -}}{{ mul $b 1099511627776 }}
+{{- else if eq $unit "k" -}}{{ mul $b 1000 }}
+{{- else if eq $unit "M" -}}{{ mul $b 1000000 }}
+{{- else if eq $unit "G" -}}{{ mul $b 1000000000 }}
+{{- else if eq $unit "T" -}}{{ mul $b 1000000000000 }}
+{{- else -}}
+{{- fail (printf "agent.goMemLimit is auto, but resources.limits.memory %q uses a unit the chart cannot read; set agent.goMemLimit to an explicit value instead" $raw) }}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- define "zensu-monitoring-agent.goMemLimit" -}}
 {{- $v := .Values.agent.goMemLimit -}}
 {{- if kindIs "invalid" $v -}}
 {{- else if kindIs "float64" $v -}}{{ printf "%.0f" $v }}
+{{- else if eq (toString $v) "auto" -}}
+{{- with (include "zensu-monitoring-agent.memoryLimitBytes" .) }}{{ div (mul (atoi .) 7) 8 }}{{ end }}
 {{- else -}}{{ toString $v }}
 {{- end -}}
 {{- end }}

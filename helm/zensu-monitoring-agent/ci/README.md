@@ -10,7 +10,10 @@ Markers:
 
 - `gomemlimit` / `no-gomemlimit` — whether the render must carry a GOMEMLIMIT
   env entry. Declared rather than inferred, so a shape cannot flip the
-  expectation by accident.
+  expectation by accident. `agent.goMemLimit: auto` derives the value from
+  `resources.limits.memory`, so the derived shape carries a raised limit to prove
+  the two move together; the value itself is asserted in the refusal suite, which
+  is where a wrong number would show.
 - `metrics-on` / `metrics-off` — whether the agent's own endpoint, its Service
   and its container port must be present.
 - `cronjob` — the workload is a CronJob and must carry `--once`.

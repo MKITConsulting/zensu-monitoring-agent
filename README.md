@@ -323,6 +323,27 @@ Secret-backed header, or drop it. (An install that omitted the scheme was never
 delivering heartbeats, because the HTTP client cannot send such a request; it now
 fails loudly instead of silently.)
 
+**The agent no longer follows redirects on the heartbeat POST.** A peer's 3xx
+would let it choose where a request carrying the API key goes next, so the client
+refuses instead, and the response surfaces as a normal error. An install whose
+`zensu.apiUrl` sits behind a permanent 308 — an `http://`→`https://` upgrade, or a
+host or path canonicalisation — has been delivering heartbeats and stops on
+upgrade, with a message that reads like a backend rejection. Point `ZENSU_API_URL`
+at the final destination. (301 and 302 were already broken for this POST, because
+Go downgrades those to GET.) A trailing slash on `zensu.apiUrl` is also no longer
+part of the request path; that one is a fix, but it changes the path an install
+that configured one has been sending.
+
+**Every workload now carries a GOMEMLIMIT.** No release had one before, and
+`agent.goMemLimit` defaults to `auto`, which derives the ceiling as 7/8 of
+`resources.limits.memory` — 56 MiB for the chart's default 64Mi limit, and
+proportionately more for a release that raised it. Deriving rather than hardcoding
+is what keeps the upgrade from handing a release with a raised limit a foreign
+ceiling it never asked for, but it is still a runtime setting that was not there
+before. A release with no memory limit gets none, `agent.goMemLimit: ""` keeps the
+runtime unbounded within the cgroup, and an explicit value overrides the
+derivation.
+
 ## Contract
 
 The agent only needs to POST this shape — so you can write your own producer

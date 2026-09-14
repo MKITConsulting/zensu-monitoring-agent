@@ -25,16 +25,22 @@ agent:
   # cronjob mode only
   schedule: "*/1 * * * *"
   # Soft heap ceiling handed to the Go runtime as GOMEMLIMIT, so it collects
-  # under pressure instead of being OOM-killed. Keep it below
+  # under pressure instead of being OOM-killed. It has to sit below
   # resources.limits.memory: the difference is headroom for memory the runtime
-  # does not account for. Raise both together, never one alone. Empty disables
-  # the setting, which leaves the runtime unbounded within the cgroup.
+  # does not account for.
   #
-  # The Go runtime parses this, NOT Kubernetes, so the suffixes are B, KiB, MiB,
-  # GiB and TiB — a Kubernetes quantity like "64Mi" copied from the limit below
-  # is rejected at process start. The chart refuses such a value rather than
-  # letting the pod crash-loop.
-  goMemLimit: "56MiB"
+  # Three states:
+  #   auto  - derive it as 7/8 of resources.limits.memory, so raising the limit
+  #           raises the ceiling with it and neither can be raised alone. With no
+  #           memory limit set there is nothing to sit below, and none is emitted.
+  #   ""    - no ceiling; the runtime stays unbounded within the cgroup.
+  #   value - an explicit ceiling, which overrides the derivation.
+  #
+  # An explicit value is parsed by the Go runtime, NOT by Kubernetes, so its
+  # suffixes are B, KiB, MiB, GiB and TiB — a Kubernetes quantity like "64Mi"
+  # copied from the limit below is rejected at process start. The chart refuses
+  # such a value rather than letting the pod crash-loop.
+  goMemLimit: "auto"
 
 # Where per-service CPU/memory come from. Uptime never depends on this.
 resourceMetrics:

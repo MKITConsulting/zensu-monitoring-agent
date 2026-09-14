@@ -173,6 +173,8 @@ jobs:
           refuse "carries credentials in its userinfo" \
             --set resourceMetrics.source=metrics-server \
             --set resourceMetrics.scrapeUrl=http://u:p@collector:8889/metrics
+          refuse "uses a unit the chart cannot read" --set resources.limits.memory=64Xi
+          refuse "is not a byte quantity the chart can read" --set resources.limits.memory=lots
           refuse "default\" ServiceAccount" \
             --set serviceAccount.create=false
           refuse "must name the allowed sources" --set metrics.networkPolicy.enabled=true
