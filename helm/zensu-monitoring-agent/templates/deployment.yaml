@@ -1,3 +1,4 @@
+{{- include "zensu-monitoring-agent.validateValues" . }}
 {{- if eq .Values.agent.mode "deployment" }}
 apiVersion: apps/v1
 kind: Deployment
@@ -43,6 +44,7 @@ spec:
                 name: {{ include "zensu-monitoring-agent.secretName" . }}
           {{- if .Values.metrics.enabled }}
           env:
+            {{- include "zensu-monitoring-agent.goMemLimitEnv" . | nindent 12 }}
             - name: ZENSU_MONITORING_AGENT_METRICS_ENABLED
               value: "true"
             - name: ZENSU_MONITORING_AGENT_METRICS_ADDR
@@ -55,6 +57,7 @@ spec:
             periodSeconds: 30
           {{- else }}
           env:
+            {{- include "zensu-monitoring-agent.goMemLimitEnv" . | nindent 12 }}
             - name: ZENSU_MONITORING_AGENT_METRICS_ENABLED
               value: "false"
           {{- end }}

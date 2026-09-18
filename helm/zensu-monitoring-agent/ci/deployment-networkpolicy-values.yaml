@@ -1,0 +1,11 @@
+# expect: gomemlimit metrics-on networkpolicy
+agent:
+  mode: deployment
+metrics:
+  enabled: true
+  networkPolicy:
+    enabled: true
+    from:
+      - podSelector:
+          matchLabels:
+            app: prometheus

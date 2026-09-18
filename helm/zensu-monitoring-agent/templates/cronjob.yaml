@@ -1,3 +1,4 @@
+{{- include "zensu-monitoring-agent.validateValues" . }}
 {{- if eq .Values.agent.mode "cronjob" }}
 apiVersion: batch/v1
 kind: CronJob
@@ -28,6 +29,10 @@ spec:
               args: ["--once"]
               securityContext:
                 {{- toYaml .Values.securityContext | nindent 16 }}
+              {{- if include "zensu-monitoring-agent.goMemLimit" . }}
+              env:
+                {{- include "zensu-monitoring-agent.goMemLimitEnv" . | nindent 16 }}
+              {{- end }}
               envFrom:
                 - configMapRef:
                     name: {{ include "zensu-monitoring-agent.fullname" . }}

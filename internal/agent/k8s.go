@@ -2,14 +2,12 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
@@ -25,7 +23,7 @@ const AnnotationService = "zensu.dev/service"
 // on self-hosted clusters: the agent logs it once and keeps sending heartbeats
 // without per-service CPU/memory. Callers should treat it as "metrics not
 // available" rather than a failure of the tick.
-var ErrMetricsAPIUnavailable = errors.New("metrics.k8s.io API not available")
+var ErrMetricsAPIUnavailable = fmt.Errorf("metrics.k8s.io API not available: %w", ErrSourceUnavailable)
 
 // ClusterReader is the minimal read-only Kubernetes surface the agent needs:
 // list Deployments, list the Pods behind a Deployment to sum restarts, and read
@@ -145,14 +143,31 @@ func MapDeployment(d appsv1.Deployment) (ServiceHeartbeat, bool) {
 	}, true
 }
 
-// deploymentSelector renders a Deployment's pod selector (MatchLabels) as a
-// label-selector string. Returns "" when the Deployment has no MatchLabels, so
-// callers skip pod listing rather than accidentally matching every pod.
+// deploymentSelector renders a Deployment's pod selector as a label-selector
+// string, honouring MatchExpressions as well as MatchLabels — a Deployment may
+// legally carry only the former, and reading MatchLabels alone silently produced
+// no selector for it. Returns "" when the Deployment selects nothing or selects
+// everything, so callers skip pod listing rather than matching every pod in the
+// namespace.
 func deploymentSelector(d appsv1.Deployment) string {
-	if d.Spec.Selector == nil || len(d.Spec.Selector.MatchLabels) == 0 {
+	if d.Spec.Selector == nil {
 		return ""
 	}
-	return labels.Set(d.Spec.Selector.MatchLabels).AsSelector().String()
+	sel, err := metav1.LabelSelectorAsSelector(d.Spec.Selector)
+	if err != nil || sel.Empty() {
+		return ""
+	}
+	return sel.String()
+}
+
+// podNames lists the Pod names behind a service, used by metric sources that
+// attribute samples through pod-scoped labels.
+func podNames(pods []corev1.Pod) []string {
+	names := make([]string, 0, len(pods))
+	for _, p := range pods {
+		names = append(names, p.Name)
+	}
+	return names
 }
 
 // sumRestarts totals the container restart counts across the given Pods.

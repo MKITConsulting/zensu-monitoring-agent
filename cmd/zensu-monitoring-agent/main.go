@@ -10,10 +10,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,14 +29,30 @@ func main() {
 	once := flag.Bool("once", false, "run a single heartbeat then exit (for a CronJob or host cron)")
 	flag.Parse()
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: envLogLevel()}))
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	if err := run(ctx, log, *once, agent.NewInClusterLister); err != nil {
+		log.Error("agent stopped", "error", err)
+		os.Exit(1)
+	}
+}
+
+// run is main() without the process-level concerns, so the startup path can be
+// exercised by a test. Every refusal main() used to inline as an os.Exit is a
+// wrapped error here, naming the stage that refused; main() logs it and exits.
+// newLister is injected because the real one needs a cluster, and every startup
+// decision below it — the source refusal, the one-shot counter caveat, whether
+// metrics are constructed at all — sits behind that call.
+func run(ctx context.Context, log *slog.Logger, once bool, newLister func() (agent.ClusterReader, error)) error {
 	apiURL := os.Getenv("ZENSU_API_URL")
 	apiKey := os.Getenv("ZENSU_API_KEY")
 	productID := os.Getenv("ZENSU_PRODUCT_ID")
-	if apiURL == "" || apiKey == "" || productID == "" {
-		log.Error("missing required config", "required", "ZENSU_API_URL, ZENSU_API_KEY, ZENSU_PRODUCT_ID")
-		os.Exit(1)
+	scrapeURL := os.Getenv("ZENSU_MONITORING_AGENT_SCRAPE_URL")
+	if err := requiredConfig(apiURL, apiKey, productID, scrapeURL); err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
 	}
 
 	cfg := agent.Config{
@@ -43,21 +62,34 @@ func main() {
 		Interval:   envDuration("ZENSU_MONITORING_AGENT_INTERVAL", 60*time.Second),
 	}
 
-	lister, err := agent.NewInClusterLister()
+	lister, err := newLister()
 	if err != nil {
-		log.Error("kubernetes client", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("kubernetes client: %w", err)
 	}
 	reporter := agent.NewReporter(apiURL, apiKey, 15*time.Second)
-	a := agent.New(cfg, lister, reporter, log)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-
-	if envBool("ZENSU_MONITORING_AGENT_METRICS_ENABLED", true) && !*once {
-		m := obs.New()
+	var m *obs.Metrics
+	metricsEnabled := envBool("ZENSU_MONITORING_AGENT_METRICS_ENABLED", true) && !once
+	if metricsEnabled {
+		m = obs.New()
 		reporter.Metrics = m
-		a.Metrics = m
+	}
+
+	sourceCfg := resourceSourceConfig(scrapeURL)
+	source, err := agent.NewMetricSource(sourceCfg, lister, log, m)
+	if err != nil {
+		return fmt.Errorf("resource metric source: %w", err)
+	}
+	log.Info("resource metric source configured", "source", source.Name())
+	if once && expositionReachable(sourceCfg) {
+		log.Warn("one-shot mode cannot rate cumulative counters: a counter-based CPU metric needs two consecutive scrapes in one process, so CPU will be absent on every run while memory still reports",
+			"mode", "cronjob", "source", source.Name())
+	}
+
+	a := agent.New(cfg, lister, reporter, log, source)
+	a.Metrics = m
+
+	if metricsEnabled {
 		addr := envOr("ZENSU_MONITORING_AGENT_METRICS_ADDR", obs.DefaultAddr)
 		log.Info("metrics endpoint enabled", "addr", addr, "path", "/metrics")
 		go func() {
@@ -67,10 +99,93 @@ func main() {
 		}()
 	}
 
-	if err := a.Run(ctx, *once); err != nil && ctx.Err() == nil {
-		log.Error("agent stopped", "error", err)
-		os.Exit(1)
+	if err := a.Run(ctx, once); err != nil && ctx.Err() == nil {
+		return err
 	}
+	return nil
+}
+
+// envLogLevel resolves the handler's minimum level. Several diagnostics — which
+// rows the row policy removed, which rows mapped to no service — are only useful
+// while an operator is debugging an attribution problem, so they are logged at
+// Debug. Without this they could not be turned on at all: a nil HandlerOptions
+// means slog's Info default, and no chart key reached it, so the lines existed
+// only for the tests that build their own handler.
+//
+// An unreadable value falls back to Info rather than refusing to start. The agent
+// would otherwise crash-loop over a logging preference, and losing the heartbeat
+// is worse than logging at the wrong level.
+func envLogLevel() slog.Level {
+	var level slog.Level
+	raw := os.Getenv("ZENSU_MONITORING_AGENT_LOG_LEVEL")
+	if raw == "" {
+		return slog.LevelInfo
+	}
+	if err := level.UnmarshalText([]byte(raw)); err != nil {
+		return slog.LevelInfo
+	}
+	return level
+}
+
+// requiredConfig holds the startup refusals main() would otherwise inline, where
+// no test can reach them. The scrape URL is checked whenever it is set rather
+// than only in the modes that scrape, because the chart writes its ConfigMap key
+// in every mode and a credential sitting there unused is exposed just the same.
+func requiredConfig(apiURL, apiKey, productID, scrapeURL string) error {
+	if apiURL == "" || apiKey == "" || productID == "" {
+		return errors.New("ZENSU_API_URL, ZENSU_API_KEY and ZENSU_PRODUCT_ID are all required")
+	}
+	if err := agent.ValidateAPIURL(apiURL); err != nil {
+		return err
+	}
+	if scrapeURL == "" {
+		return nil
+	}
+	return agent.ValidateScrapeURL(scrapeURL)
+}
+
+// resourceSourceConfig reads the resource-metric source settings. The knob is
+// RESOURCE_SOURCE rather than METRICS_SOURCE because METRICS_ENABLED and
+// METRICS_ADDR are already taken and mean the agent's OWN endpoint.
+func resourceSourceConfig(scrapeURL string) agent.SourceConfig {
+	return agent.SourceConfig{
+		Mode: envOr("ZENSU_MONITORING_AGENT_RESOURCE_SOURCE", agent.SourceAuto),
+		Exposition: agent.ExpositionConfig{
+			URL:          scrapeURL,
+			SlugLabel:    envOr("ZENSU_MONITORING_AGENT_SCRAPE_SLUG_LABEL", agent.DefaultSlugLabel),
+			CPUMetric:    os.Getenv("ZENSU_MONITORING_AGENT_SCRAPE_CPU_METRIC"),
+			MemoryMetric: os.Getenv("ZENSU_MONITORING_AGENT_SCRAPE_MEMORY_METRIC"),
+			Timeout:      envDuration("ZENSU_MONITORING_AGENT_SCRAPE_TIMEOUT", agent.DefaultScrapeTimeout),
+			MaxBytes:     envInt64("ZENSU_MONITORING_AGENT_SCRAPE_MAX_BYTES", 0),
+		},
+	}
+}
+
+// expositionReachable reports whether the configuration can ever scrape, which
+// is what decides whether the one-shot counter caveat applies. It is gated on
+// configuration rather than on the resolved source's name: in the default auto
+// mode the composite reports its primary until a fallthrough happens, which by
+// definition has not happened at startup, so a name check would silence the
+// warning in exactly the setup it exists for.
+func expositionReachable(cfg agent.SourceConfig) bool {
+	if cfg.Exposition.URL == "" {
+		return false
+	}
+	switch cfg.Mode {
+	case agent.SourceExposition, agent.SourceAuto, "":
+		return true
+	default:
+		return false
+	}
+}
+
+func envInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
 }
 
 func envOr(key, def string) string {
@@ -91,9 +206,12 @@ func envBool(key string, def bool) bool {
 	}
 }
 
+// envDuration falls back to def for a non-positive value as well as an
+// unparsable one: every duration the agent reads is an interval or a timeout,
+// and zero or negative makes neither usable.
 func envDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			return d
 		}
 	}

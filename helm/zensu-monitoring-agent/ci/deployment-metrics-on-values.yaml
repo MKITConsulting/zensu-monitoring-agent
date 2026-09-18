@@ -1,0 +1,6 @@
+# expect: gomemlimit metrics-on
+agent:
+  mode: deployment
+  goMemLimit: "56MiB"
+metrics:
+  enabled: true

@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -94,11 +95,31 @@ func TestSetServicesReported(t *testing.T) {
 	}
 }
 
+// TestNilMetricsAreNoOp pins the contract that EVERY method on *Metrics is safe
+// on a nil receiver, because metrics.enabled=false is a shipped configuration
+// that leaves the pointer nil — a dropped guard panics a supported deployment
+// rather than degrading it. The method set is walked by reflection rather than
+// listed, so a method added without a guard fails here the day it lands; a
+// hand-written list would only cover what someone remembered to add to it.
 func TestNilMetricsAreNoOp(t *testing.T) {
 	var m *Metrics
-	m.RecordHeartbeat(true, time.Second)
-	m.RecordHeartbeat(false, time.Second)
-	m.SetServicesReported(3)
+	nilValue := reflect.ValueOf(m)
+	for i := range nilValue.NumMethod() {
+		method := nilValue.Type().Method(i)
+		args := make([]reflect.Value, method.Type.NumIn()-1)
+		for j := range args {
+			args[j] = reflect.New(method.Type.In(j + 1)).Elem()
+		}
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("nil %s panicked: %v — every method needs its own nil guard", method.Name, r)
+				}
+			}()
+			nilValue.Method(i).Call(args)
+		}()
+	}
+
 	if err := m.Serve(context.Background(), ":2112"); err != nil {
 		t.Errorf("nil Serve = %v, want nil", err)
 	}
@@ -159,5 +180,53 @@ func TestServeGracefulShutdown(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not shut down within 5s of ctx cancel")
+	}
+}
+
+// TestRecordScrapeCountsByResult pins the scrape counters and the duration
+// observation inside their own package, so an inverted label is caught here
+// rather than only from the agent package.
+func TestRecordScrapeCountsByResult(t *testing.T) {
+	m := NewWithRegistry(prometheus.NewRegistry())
+	m.RecordScrape(true, 2*time.Second)
+	m.RecordScrape(false, time.Second)
+	m.RecordScrape(false, time.Second)
+
+	if got := testutil.ToFloat64(m.scrapes.WithLabelValues("success")); got != 1 {
+		t.Errorf("success = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.scrapes.WithLabelValues("error")); got != 2 {
+		t.Errorf("error = %v, want 2", got)
+	}
+
+	srv := httptest.NewServer(m.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+
+	for _, want := range []string{
+		"zensu_monitoring_agent_scrape_duration_seconds_count 3",
+		`zensu_monitoring_agent_scrape_duration_seconds_bucket{le="1"} 2`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("duration histogram missing %q (unit bug?); body:\n%s", want, text)
+		}
+	}
+}
+
+func TestSetResourceServicesMapped(t *testing.T) {
+	m := NewWithRegistry(prometheus.NewRegistry())
+	m.SetResourceServicesMapped(4)
+	if got := testutil.ToFloat64(m.resourceServicesMapped); got != 4 {
+		t.Errorf("gauge = %v, want 4", got)
+	}
+	m.SetResourceServicesMapped(0)
+	if got := testutil.ToFloat64(m.resourceServicesMapped); got != 0 {
+		t.Errorf("gauge = %v, want 0 after reset", got)
 	}
 }

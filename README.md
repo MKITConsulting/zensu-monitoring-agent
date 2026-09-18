@@ -18,10 +18,10 @@ a documented public contract — point anything at it (see [Contract](#contract)
 1. You annotate the workloads you want tracked.
 2. The agent lists those Deployments (read-only) on an interval, and the Pods
    behind each one to total their container restart counts.
-3. If [metrics-server](https://github.com/kubernetes-sigs/metrics-server) is
-   installed, it also reads current per-service **CPU** (millicores) and
-   **memory** (bytes) from the `metrics.k8s.io` API, summed across all
-   containers of all matching Pods.
+3. It reads current per-service **CPU** (millicores) and **memory** (bytes) from
+   a resource source — [metrics-server](https://github.com/kubernetes-sigs/metrics-server)
+   or the Prometheus exposition of an OpenTelemetry Collector — summed across
+   all matching Pods. See [Resource metric sources](#resource-metric-sources).
 4. It POSTs each service's status to `${ZENSU_API_URL}/api/runtime/heartbeat`
    with an `X-API-Key`.
 
@@ -30,25 +30,120 @@ Status is derived from replica counts: all ready → `up`, some ready →
 summed container `restartCount` and, when available, a `metrics` array of
 typed `{key, value}` samples (`cpu_millicores`, `memory_bytes`).
 
-**Graceful degrade.** Reading CPU/memory is best-effort and entirely optional.
-On clusters without metrics-server (common for self-hosted installs), the
-`metrics.k8s.io` API is simply absent: the agent logs a single warning, omits
-the `metrics` array, and keeps sending heartbeats — status and `restartCount`
-are unaffected. A transient metrics-server error skips metrics for that one tick
-only; the heartbeat still goes out.
+**Graceful degrade.** Reading CPU/memory is best-effort and entirely optional,
+and it degrades per source. On a cluster without metrics-server the
+`metrics.k8s.io` API is simply absent: the agent logs one warning and, if a
+collector exposition is configured, reads CPU/memory from there instead — see
+[Resource metric sources](#resource-metric-sources). With no configured
+fallback it omits the `metrics` array and keeps sending heartbeats. Either way
+status and `restartCount` are unaffected, and a transient failure of whichever
+source is in use costs metrics for that one tick only.
 
-**Enabling CPU/memory.** metrics-server is not a Kubernetes default. Managed clusters
-(GKE, AKS, k3s) usually ship it; EKS, kubeadm, and most bare-metal clusters do not. If
-it is absent and you want CPU/memory (uptime needs nothing), install the standard,
-free add-on:
+## Resource metric sources
+
+Uptime never depends on any of this — it comes from Deployment status alone. CPU and
+memory need a source, and there are two.
+
+**metrics-server** is the default, but it is not a Kubernetes default. Managed clusters
+(GKE, AKS, k3s) usually ship it; EKS, kubeadm, and most bare-metal clusters do not. If it
+is absent and you want CPU/memory, install the standard, free add-on:
 
 ```sh
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 ```
 
-On clusters that standardize on Prometheus instead, a Prometheus-backed source is on the
-roadmap (read the customer's existing Prometheus over PromQL, no extra cluster
-privilege).
+**A collector exposition** is the alternative for clusters that already run an
+OpenTelemetry Collector. Point the agent at the collector's Prometheus exposition and it
+reads CPU/memory from there — no metrics-server, no extra cluster privilege, one more
+outbound HTTP call:
+
+```bash
+--set resourceMetrics.scrapeUrl=http://otel-collector.observability:8889/metrics
+```
+
+`resourceMetrics.source` picks the behaviour: `auto` (default) reads metrics-server and
+falls through to the exposition **only** when the cluster has no `metrics.k8s.io` API and
+a scrape URL is set; `metrics-server` and `exposition` pin one source; `none` disables
+resource metrics entirely. The fallthrough is one-way and logged once.
+
+**Which metrics are read.** The agent probes the exposition for known names and takes the
+first match, so no configuration is needed for the common pipelines. Whether a series is
+a gauge or a counter is read from its `# TYPE` line, not configured. Unit suffixes are
+ignored when matching, so `k8s_pod_memory_working_set` and
+`k8s_pod_memory_working_set_bytes` are the same metric — but only one exposition family
+ever wins, so a pipeline exposing both a gauge and a cumulative counter under the same
+base name is never mixed into one reading.
+
+Counters are converted to a per-second rate, which needs two consecutive scrapes of the
+same series in the same process. A service therefore reports no CPU until every one of
+its pods has been seen twice: the first tick after start, and the tick after a pod is
+replaced or a counter resets. A partial reading is withheld rather than reported, because
+a fraction of a service's real usage is worse than a gap. A cumulative **memory** family
+is refused outright rather than rated — bytes per second is not a byte count.
+
+In `agent.mode=cronjob` the process exits after one tick, so a counter never gets its
+second scrape: a cronjob install whose CPU metric resolves to a counter reports memory
+but never CPU. The agent warns about this at startup. Use `deployment` mode, or a gauge
+CPU metric such as `k8s_pod_cpu_usage`.
+
+| Role | Probed in order | From |
+|---|---|---|
+| CPU | `k8s_pod_cpu_usage`, `k8s_pod_cpu_time`, `container_cpu_usage_seconds_total` | kubeletstats receiver, then cAdvisor |
+| Memory | `k8s_pod_memory_working_set`, `container_memory_working_set_bytes` | kubeletstats receiver, then cAdvisor |
+
+For a container-scoped family the agent sums the per-container rows and skips that
+pod's own pod-level row, which would otherwise count the pod twice; cAdvisor's
+`container="POD"` pause rows are excluded entirely. A pod that exposes only a
+pod-level row keeps it. So a `zensu` CPU figure is deliberately not the same number
+as a bare `sum(container_cpu_usage_seconds_total)` over the same pods.
+
+One shape the agent cannot resolve: a pod-level row that carries no `namespace`
+label while the same metric carries namespaced container rows for that pod name.
+It is either that pod's total or a same-named pod's only row in another namespace,
+and nothing in the exposition says which. The agent drops it — over-reporting a
+service is the worse failure — and logs a warning naming the pod, so project the
+namespace label consistently in your collector if you see one.
+
+Set `resourceMetrics.cpuMetric` / `resourceMetrics.memoryMetric` only if your pipeline
+exposes none of these. An override is expected to report CPU in cores (or cumulative
+seconds) and memory in bytes.
+
+**Telling the agent which service a sample belongs to.** Best is an explicit label whose
+value is the Zensu service slug. Your Deployments already carry the
+`zensu.dev/service` annotation for uptime discovery, so project it in the collector:
+
+```yaml
+processors:
+  k8sattributes:
+    extract:
+      annotations:
+        - key: zensu.dev/service
+          tag_name: zensu_service
+          from: pod
+```
+
+Without that label the agent falls back to matching the sample's `pod`/`k8s_pod_name` and
+`namespace`/`k8s_namespace_name` labels against the Pods it already discovered, which
+works with no collector configuration at all but cannot resolve a pod name that is
+ambiguous across namespaces. Samples that match no tracked service are dropped, and a
+metric whose rows ALL drop is reported at warn — that is a projection failure rather
+than a collector that merely also covers untracked workloads.
+
+Watch `zensu_monitoring_agent_resource_samples{role}` on the agent's own `/metrics`: it
+counts the services that received each role, so a loss that costs only CPU or only
+memory is visible. `resource_services_mapped` counts services rather than roles, so it
+still reads healthy while half the data is missing — a successful scrape with zero
+mapped services means attribution rather than the scrape needs fixing, but a non-zero
+one proves nothing about either role on its own. `resource_source{source}` names the
+source that actually served the last tick, which `scrape_total` cannot: that counter is
+pre-initialised in modes that never scrape, so a zero rate reads the same on a healthy
+metrics-server tick as on an exposition that stopped. For the two row-level diagnostics
+— which rows the row policy removed, which mapped to nothing — set `agent.logLevel:
+debug`.
+
+**Graceful degrade applies to every source.** A failed scrape, an unreachable collector,
+or an exposition without any known metric costs the metrics for that tick only — status
+and `restartCount` still ship.
 
 ## Trust / security
 
@@ -65,9 +160,40 @@ privilege).
   endpoint returns `403 forbidden`, so a leaked agent key cannot mutate your data.
   A broad `write` (or `admin`) key still works for backward compatibility, but
   over-privileges an ingest-only client and is discouraged.
-- **Outbound-only egress.** The single network call is the heartbeat POST to the
-  `ZENSU_API_URL` you configure — no inbound ports, no other destinations. See
-  [`internal/agent/reporter.go`](internal/agent/reporter.go).
+- **Outbound-only egress.** By default the single outbound call is the heartbeat POST to
+  the `ZENSU_API_URL` you configure — no other destinations. Neither HTTP client follows
+  redirects, so no endpoint can send the agent somewhere you did not configure. The one
+  inbound listener is the agent's own `/metrics` port, on by default in deployment mode and
+  disabled with `metrics.enabled=false`; restrict reach to it with
+  `metrics.networkPolicy.enabled` **and** `metrics.networkPolicy.from`, which names the
+  allowed sources — `from` is mandatory, and enabling the policy without it fails the
+  render rather than deploying a policy that admits everyone. See
+  [`internal/agent/reporter.go`](internal/agent/reporter.go). Setting
+  `resourceMetrics.scrapeUrl` adds exactly one more outbound destination: a plain HTTP GET
+  to that endpoint, once per heartbeat interval, sending no credentials. It stays exactly
+  one — the scrape client refuses to follow redirects, so the endpoint cannot send the
+  agent somewhere else. The bundled NetworkPolicy governs **ingress** to the agent's own
+  `/metrics` port only and does not restrict egress, so an egress policy of your own is
+  yours to add. The scrape sends no authentication, so the exposition is expected to be a
+  cluster-internal endpoint; there is no bearer-token or client-certificate option yet, and
+  a protected exposition is not supported rather than something to unauthenticate.
+  USERINFO credentials in either URL are refused — see
+  [Configuration](#configuration) for the exact rule. That is the only credential
+  shape detected. A token carried in the PATH — `https://collector:8889/api/prom/
+  <tenant>/<token>/metrics`, the shape multi-tenant metric backends actually use —
+  or in the query string is NOT detected, and sits in the ConfigMap in clear text
+  just the same. Note also that the agent trusts the scrape target
+  to say which service each measurement belongs to, so a compromised or misconfigured
+  collector can misattribute usage. One availability note: the agent buffers a body it
+  does not control up to `scrapeMaxBytes` and hands it to the parser whole, so peak
+  memory is that cap times a measured allocation factor of ~9.3x rather than the cap
+  itself — 7.9 MiB of body allocates 70.3 MiB and settles at 59-69 MiB RSS under the
+  chart's `GOMEMLIMIT=56MiB` and `64Mi` limit. The series ceiling bounds what is retained
+  between scrapes, not that peak, and neither does the family filter. Because the factor
+  is measured, the agent derives the largest cap it will honour from `agent.goMemLimit`
+  (that limit divided by 10, floored at the 8 MiB default): raising
+  `resourceMetrics.scrapeMaxBytes` without also raising `agent.goMemLimit` and
+  `resources.limits.memory` is refused rather than merely discouraged.
 - **Hardened container.** Distroless `nonroot`, read-only root filesystem, all
   Linux capabilities dropped.
 - **Auditable.** A few hundred lines of Go. Read it.
@@ -94,7 +220,7 @@ metadata:
 
 | Env | Required | Default | Description |
 |---|---|---|---|
-| `ZENSU_API_URL` | yes | — | Zensu API base URL |
+| `ZENSU_API_URL` | yes | — | Zensu API base URL. Needs an `http://` or `https://` scheme and a host; userinfo credentials (`https://user:pass@host`) are refused. Both URLs are rendered into a ConfigMap in clear text, so the chart **fails the render** before a userinfo credential reaches the cluster, and the agent refuses to start as well. A credential carried in the path or the query string is not a shape either check recognises. |
 | `ZENSU_API_KEY` | yes | — | API key (`zsk_...`); mint with only the `runtime` scope — see [Trust / security](#trust--security) |
 | `ZENSU_PRODUCT_ID` | yes | — | Product UUID to report to |
 | `ZENSU_MONITORING_AGENT_INTERVAL` | no | `60s` | Heartbeat cadence (Go duration) |
@@ -102,10 +228,20 @@ metadata:
 | `ZENSU_MONITORING_AGENT_SOURCE` | no | `k8s-agent` | Source label attached to heartbeats |
 | `ZENSU_MONITORING_AGENT_METRICS_ENABLED` | no | `true` | Serve the Prometheus `/metrics` endpoint (deployment mode only) |
 | `ZENSU_MONITORING_AGENT_METRICS_ADDR` | no | `:2112` | Listen address for the `/metrics` endpoint |
+| `ZENSU_MONITORING_AGENT_RESOURCE_SOURCE` | no | `auto` | Where CPU/memory come from: `auto`, `metrics-server`, `exposition`, `none` — see [Resource metric sources](#resource-metric-sources) |
+| `ZENSU_MONITORING_AGENT_SCRAPE_URL` | no | — | Prometheus exposition to scrape, e.g. an OpenTelemetry Collector. Held to the same rule as `ZENSU_API_URL`, and checked whenever it is set — the ConfigMap key is written whatever `RESOURCE_SOURCE` says, so a credential in an unused scrape URL is exposed just the same. |
+| `ZENSU_MONITORING_AGENT_SCRAPE_SLUG_LABEL` | no | `zensu_service` | Label on the scraped series whose value is the service slug |
+| `ZENSU_MONITORING_AGENT_SCRAPE_CPU_METRIC` | no | — | Override the auto-detected CPU metric name |
+| `ZENSU_MONITORING_AGENT_SCRAPE_MEMORY_METRIC` | no | — | Override the auto-detected memory metric name |
+| `ZENSU_MONITORING_AGENT_SCRAPE_TIMEOUT` | no | `10s` | Per-scrape HTTP timeout (Go duration), covering the whole request |
+| `ZENSU_MONITORING_AGENT_SCRAPE_MAX_BYTES` | no | `8388608` (8 MiB) | Cap on the exposition body in bytes. The honoured ceiling is `GOMEMLIMIT / 10` (the measured allocation factor), floored at the 8 MiB default and capped at 16 MiB; a value above it falls back to the default. A scrape carrying more than 50 000 series **of the families the agent matches** is refused regardless; families it does not match are dropped before they count. Raising this cap is only safe together with `resources.limits.memory` and `agent.goMemLimit`. |
 
-Helm values mirror these under `zensu.*` / `agent.*`, and the metrics toggles
-live under `metrics.*` (the metrics env vars are wired into the Deployment
-automatically when `metrics.enabled=true`) — see
+`METRICS_*` configures the agent's **own** endpoint; `RESOURCE_SOURCE` / `SCRAPE_*`
+configure where it **reads** service CPU/memory. The two are unrelated.
+
+Helm values mirror these under `zensu.*` / `agent.*` / `resourceMetrics.*`, and the
+metrics toggles live under `metrics.*` (the metrics env vars are wired into the
+Deployment automatically when `metrics.enabled=true`) — see
 [`values.yaml`](helm/zensu-monitoring-agent/values.yaml). Supply the API key out-of-band with
 `zensu.existingSecret` (a Secret holding key `ZENSU_API_KEY`) instead of
 `zensu.apiKey`.
@@ -118,6 +254,12 @@ ServiceAccount token (in-cluster config):
 - `agent.mode=deployment` (default): long-running ticker.
 - `agent.mode=cronjob`: one-shot per `agent.schedule` (runs the binary with
   `--once`).
+- `agent.goMemLimit` becomes the container's `GOMEMLIMIT`, a soft heap ceiling that
+  keeps the Go runtime collecting under pressure instead of being OOM-killed. It
+  sits below `resources.limits.memory` on purpose. The default, the accepted syntax
+  and the reason for both are on the value itself in
+  [`values.yaml`](helm/zensu-monitoring-agent/values.yaml); the chart refuses a
+  value the Go runtime would reject rather than crash-looping the pod.
 
 Running off-cluster (the binary on a VM cron host talking to a remote cluster
 via a kubeconfig) is not supported yet, and a `--probe-url` mode for
@@ -139,6 +281,12 @@ Exposed series (plus the standard `go_*` / `process_*` collectors):
 | `zensu_monitoring_agent_last_success_timestamp_seconds` | gauge | Unix time of the last successful POST (alert on staleness) |
 | `zensu_monitoring_agent_post_duration_seconds` | histogram | Heartbeat POST latency |
 | `zensu_monitoring_agent_services_reported` | gauge | Services in the last successful batch |
+| `zensu_monitoring_agent_scrape_total{result="success\|error"}` | counter | Collector-exposition scrapes by outcome (exposition source only) |
+| `zensu_monitoring_agent_scrape_duration_seconds` | histogram | Collector-exposition scrape latency |
+| `zensu_monitoring_agent_resource_services_mapped` | gauge | Services that received CPU/memory in the last tick, whatever the source |
+| `zensu_monitoring_agent_resource_samples{role="cpu\|memory"}` | gauge | Services that received THIS role in the last tick — the one that sees a per-role loss |
+| `zensu_monitoring_agent_resource_roles_withheld{role="cpu\|memory"}` | gauge | Services whose role was withheld because not all of their rows produced a rate |
+| `zensu_monitoring_agent_resource_source{source="metrics-server\|exposition\|none"}` | gauge | 1 for the source in use in the last tick, 0 for the others |
 
 Enable scraping one of two ways:
 
@@ -175,11 +323,43 @@ metrics:
             kubernetes.io/metadata.name: monitoring
 ```
 
-Two cautions: with an empty `from` the policy restricts only the port (not the
-source), so set `from` to actually scope who may scrape. And since the readiness
+Two cautions: `from` is mandatory once the policy is enabled — the chart refuses
+to render with an empty list rather than shipping a policy that scopes the port
+but not the source. **This is breaking for an existing release** that runs
+`metrics.networkPolicy.enabled=true` with the default empty `from`: the next
+`helm upgrade` fails until you supply `from` (that release was admitting every
+source anyway, which is what the guard exists to stop). And since the readiness
 probe is a kubelet-issued HTTP check (originating from the node, not a pod), a
 `from` that excludes the node can flap the pod to NotReady — allow the node/kubelet
 source when you restrict ingress.
+
+**The URL rules are breaking for an existing release too.** An install whose
+`zensu.apiUrl` carries basic-auth userinfo has been working and now fails the
+render — see [Configuration](#configuration). Move the credential to a proxy or a
+Secret-backed header, or drop it. (An install that omitted the scheme was never
+delivering heartbeats, because the HTTP client cannot send such a request; it now
+fails loudly instead of silently.)
+
+**The agent no longer follows redirects on the heartbeat POST.** A peer's 3xx
+would let it choose where a request carrying the API key goes next, so the client
+refuses instead, and the response surfaces as a normal error. An install whose
+`zensu.apiUrl` sits behind a permanent 308 — an `http://`→`https://` upgrade, or a
+host or path canonicalisation — has been delivering heartbeats and stops on
+upgrade, with a message that reads like a backend rejection. Point `ZENSU_API_URL`
+at the final destination. (301 and 302 were already broken for this POST, because
+Go downgrades those to GET.) A trailing slash on `zensu.apiUrl` is also no longer
+part of the request path; that one is a fix, but it changes the path an install
+that configured one has been sending.
+
+**Every workload now carries a GOMEMLIMIT.** No release had one before, and
+`agent.goMemLimit` defaults to `auto`, which derives the ceiling as 7/8 of
+`resources.limits.memory` — 56 MiB for the chart's default 64Mi limit, and
+proportionately more for a release that raised it. Deriving rather than hardcoding
+is what keeps the upgrade from handing a release with a raised limit a foreign
+ceiling it never asked for, but it is still a runtime setting that was not there
+before. A release with no memory limit gets none, `agent.goMemLimit: ""` keeps the
+runtime unbounded within the cgroup, and an explicit value overrides the
+derivation.
 
 ## Contract
 

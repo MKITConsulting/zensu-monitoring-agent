@@ -1,0 +1,11 @@
+# expect: gomemlimit metrics-on
+agent:
+  mode: deployment
+  goMemLimit: "auto"
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi

@@ -1,0 +1,6 @@
+# expect: gomemlimit metrics-on podannotations
+agent:
+  mode: deployment
+metrics:
+  enabled: true
+  podAnnotations: true

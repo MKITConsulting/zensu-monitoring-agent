@@ -1,0 +1,9 @@
+# expect: gomemlimit metrics-on no-rbac
+agent:
+  mode: deployment
+metrics:
+  enabled: true
+rbac:
+  create: false
+serviceAccount:
+  create: false
