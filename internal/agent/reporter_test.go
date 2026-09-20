@@ -18,6 +18,9 @@ import (
 	"github.com/MKITConsulting/zensu-monitoring-agent/internal/redact"
 )
 
+// TestReporterSend hands the captured request over through a buffered channel:
+// the handler runs on the server's own goroutine, and a completed round trip is
+// not a happens-before edge for a plain variable.
 func TestReporterSend(t *testing.T) {
 	type request struct {
 		key  string
@@ -64,6 +67,9 @@ func TestReporterSend_RejectsNon2xx(t *testing.T) {
 	}
 }
 
+// TestReporterRefusesRedirect pins that the credential-carrying client will not
+// follow a 3xx. A heartbeat POST has no legitimate redirect, and following one
+// would send the API key to a destination the operator never configured.
 func TestReporterRefusesRedirect(t *testing.T) {
 	var elsewhereHits atomic.Int64
 	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -86,6 +92,8 @@ func TestReporterRefusesRedirect(t *testing.T) {
 	}
 }
 
+// TestReporterBoundsAndStripsPeerText pins that a rejecting endpoint cannot put
+// unbounded or control bytes into the agent's log.
 func TestReporterBoundsAndStripsPeerText(t *testing.T) {
 	body := "rejected\n\x1b[31m\x00" + strings.Repeat("B", 8192)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -110,8 +118,18 @@ func TestReporterBoundsAndStripsPeerText(t *testing.T) {
 	}
 }
 
+// refusingTransport fails every request the way a refused dial does, so the
+// test depends on neither a freed ephemeral port nor the platform's syscall
+// wording.
 type refusingTransport struct{}
 
+func (refusingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("connect: connection refused")
+}
+
+// TestReporterTransportErrorOmitsTheURL pins the same property on the heartbeat
+// client as on the scrape client. Both call (*http.Client).Do, and *url.Error
+// embeds the full URL in its Error().
 func TestReporterTransportErrorOmitsTheURL(t *testing.T) {
 	const base = "https://zensu.invalid"
 	rep := NewReporter(base, "zsk_test", time.Second)
