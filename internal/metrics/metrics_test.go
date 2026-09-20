@@ -230,3 +230,122 @@ func TestSetResourceServicesMapped(t *testing.T) {
 		t.Errorf("gauge = %v, want 0 after reset", got)
 	}
 }
+
+// TestEveryResourceLabelIsPreInitialised pins what ResourceRoles and
+// ResourceSources exist for: a role or source that never reports must read 0
+// rather than be absent, because a rate() or a threshold alert cannot tell an
+// absent series from a healthy quiet one. Every other assertion in the suite
+// writes its series with a setter first, so nothing else can observe absence.
+func TestEveryResourceLabelIsPreInitialised(t *testing.T) {
+	m := NewWithRegistry(prometheus.NewRegistry())
+
+	srv := httptest.NewServer(m.Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+
+	for _, role := range ResourceRoles {
+		for _, name := range []string{"resource_samples", "resource_roles_withheld"} {
+			want := "zensu_monitoring_agent_" + name + `{role="` + role + `"} 0` + "\n"
+			if !strings.Contains(text, want) {
+				t.Errorf("missing %q before any setter ran; body:\n%s", want, text)
+			}
+		}
+	}
+	for _, source := range ResourceSources {
+		want := `zensu_monitoring_agent_resource_source{source="` + source + `"} 0` + "\n"
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q before any setter ran; body:\n%s", want, text)
+		}
+	}
+
+	// Presence alone would let a loop pre-initialise the right vec plus a wrong
+	// one. The counts bound each vec to exactly its own label set, which is the
+	// cardinality guarantee SetResourceSource's fold exists to hold.
+	for _, c := range []struct {
+		metric string
+		want   int
+	}{
+		{"resource_samples", len(ResourceRoles)},
+		{"resource_roles_withheld", len(ResourceRoles)},
+		{"resource_source", len(ResourceSources)},
+	} {
+		if got := strings.Count(text, "zensu_monitoring_agent_"+c.metric+"{"); got != c.want {
+			t.Errorf("%s has %d series, want %d — no vec may carry a label from another set", c.metric, got, c.want)
+		}
+	}
+}
+
+// TestResourceSettersRecordTheirValues closes a verification gap rather than a
+// behaviour gap: until it existed, the only assertions of these three setters
+// lived in the agent package and read the rendered exposition, so this package's
+// own suite passed over a broken setter and could not be refactored or re-homed
+// without borrowing another package's tests as its spec.
+func TestResourceSettersRecordTheirValues(t *testing.T) {
+	m := NewWithRegistry(prometheus.NewRegistry())
+
+	m.SetResourceSamples("cpu", 3)
+	m.SetResourceSamples("memory", 7)
+	if got := testutil.ToFloat64(m.resourceSamples.WithLabelValues("cpu")); got != 3 {
+		t.Errorf("resource_samples{cpu} = %v, want 3", got)
+	}
+	if got := testutil.ToFloat64(m.resourceSamples.WithLabelValues("memory")); got != 7 {
+		t.Errorf("resource_samples{memory} = %v, want 7 — the role argument must reach the label", got)
+	}
+	m.SetResourceSamples("cpu", 0)
+	if got := testutil.ToFloat64(m.resourceSamples.WithLabelValues("memory")); got != 7 {
+		t.Errorf("resource_samples{memory} = %v, want 7 still — clearing one role must not clear the other", got)
+	}
+
+	m.SetRolesWithheld("cpu", 2)
+	m.SetRolesWithheld("memory", 5)
+	if got := testutil.ToFloat64(m.rolesWithheld.WithLabelValues("cpu")); got != 2 {
+		t.Errorf("roles_withheld{cpu} = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.rolesWithheld.WithLabelValues("memory")); got != 5 {
+		t.Errorf("roles_withheld{memory} = %v, want 5 — the role argument must reach the label", got)
+	}
+	m.SetRolesWithheld("cpu", 0)
+	if got := testutil.ToFloat64(m.rolesWithheld.WithLabelValues("cpu")); got != 0 {
+		t.Errorf("roles_withheld{cpu} = %v, want 0 after the role stops being withheld", got)
+	}
+	if got := testutil.ToFloat64(m.rolesWithheld.WithLabelValues("memory")); got != 5 {
+		t.Errorf("roles_withheld{memory} = %v, want 5 still — clearing one role must not clear the other", got)
+	}
+
+	m.SetResourceSource(SourceExposition)
+	for _, source := range ResourceSources {
+		want := 0.0
+		if source == SourceExposition {
+			want = 1
+		}
+		if got := testutil.ToFloat64(m.resourceSource.WithLabelValues(source)); got != want {
+			t.Errorf("resource_source{%s} = %v, want %v — exactly one series is 1", source, got, want)
+		}
+	}
+}
+
+// TestSetResourceSourceFlagsAnUnlistedName pins that a name outside the
+// canonical set is reported rather than swallowed, which is what SourceUnknown
+// is declared for.
+func TestSetResourceSourceFlagsAnUnlistedName(t *testing.T) {
+	m := NewWithRegistry(prometheus.NewRegistry())
+	m.SetResourceSource("auto")
+
+	if got := testutil.ToFloat64(m.resourceSource.WithLabelValues(SourceUnknown)); got != 1 {
+		t.Errorf("%s = %v, want 1 — an unlisted name must be visible", SourceUnknown, got)
+	}
+	for _, source := range ResourceSources {
+		if source == SourceUnknown {
+			continue
+		}
+		if got := testutil.ToFloat64(m.resourceSource.WithLabelValues(source)); got != 0 {
+			t.Errorf("%s = %v, want 0 — only the unknown series reports an unlisted name", source, got)
+		}
+	}
+}

@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -34,11 +35,25 @@ type Metrics struct {
 // rate() or a threshold alert cannot distinguish from a healthy quiet one.
 var ResourceRoles = []string{"cpu", "memory"}
 
+// The canonical resource-source names. They live here rather than beside the
+// sources themselves because this package cannot import the one that implements
+// them, while that one can import this: declaring them once is what keeps the
+// exported label set and the names a source can report from drifting apart.
+const (
+	SourceMetricsServer = "metrics-server"
+	SourceExposition    = "exposition"
+	SourceNone          = "none"
+	// SourceUnknown carries a name that is not one of the others. It exists so
+	// drift is visible: without it an unrecognised name leaves every series at
+	// 0, which a scrape cannot tell from one taken before the first tick.
+	SourceUnknown = "unknown"
+)
+
 // ResourceSources are the source names resourceSource may carry. Listing them
 // keeps every label pre-initialised, so "which source is this pod on" is
 // answerable from one scrape rather than by waiting for the active one to
 // appear.
-var ResourceSources = []string{"metrics-server", "exposition", "none"}
+var ResourceSources = []string{SourceMetricsServer, SourceExposition, SourceNone, SourceUnknown}
 
 func New() *Metrics {
 	return NewWithRegistry(prometheus.NewRegistry())
@@ -168,10 +183,15 @@ func (m *Metrics) SetResourceSamples(role string, n int) {
 // and 0 for the rest. Without it the source in use is not observable at all on a
 // pod that has been running for a week, and scrape_total cannot answer it: the
 // counter is pre-initialised in modes that never scrape, so a zero rate reads the
-// same as a healthy metrics-server tick and as an exposition that stopped.
+// same as a healthy metrics-server tick and as an exposition that stopped. A name
+// outside ResourceSources is recorded as SourceUnknown, so exactly one series is
+// always 1 and an unrecognised caller shows up instead of disappearing.
 func (m *Metrics) SetResourceSource(active string) {
 	if m == nil {
 		return
+	}
+	if !slices.Contains(ResourceSources, active) {
+		active = SourceUnknown
 	}
 	for _, source := range ResourceSources {
 		value := 0.0

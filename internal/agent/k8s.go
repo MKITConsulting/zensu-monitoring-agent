@@ -35,11 +35,18 @@ type ClusterReader interface {
 	// PodMetricsForSelector sums current CPU (millicores) and memory (bytes)
 	// across every container of every pod matching selector in namespace.
 	//
-	// available reports whether usable metrics were obtained. When the cluster
-	// has no metrics-server, the returned error is ErrMetricsAPIUnavailable and
-	// available is false; callers degrade gracefully (heartbeat without
-	// metrics) instead of failing. Transient errors are returned as-is with
-	// available false.
+	// Callers must read BOTH results, because available is not equivalent to
+	// err == nil. err classifies the failure: ErrMetricsAPIUnavailable means
+	// this cluster cannot serve metrics at all, so the caller degrades
+	// gracefully (heartbeat without metrics) rather than failing, while any
+	// other error is returned as-is and skips this one target — a transient
+	// condition recovers on the next tick, a permission failure does not.
+	// available then decides whether cpuMillicores and memBytes may be used,
+	// and a nil err alone never licenses reading them: a read that SUCCEEDS
+	// while matching no pod metrics returns a nil error with available false,
+	// because summing nothing to zero would publish a reading never taken.
+	// When available is false the two values are unspecified and must not be
+	// read; clientsetLister reports 0, 0.
 	PodMetricsForSelector(ctx context.Context, namespace, selector string) (cpuMillicores, memBytes int64, available bool, err error)
 }
 
@@ -68,6 +75,10 @@ func (l clientsetLister) ListPods(ctx context.Context, namespace, selector strin
 // pods and totals CPU/memory across all their containers. A missing
 // metrics.k8s.io API (no metrics-server) is mapped to ErrMetricsAPIUnavailable
 // so the caller can degrade gracefully; any other error is returned verbatim.
+// An empty list reports no data rather than a total of zero: metrics-server
+// needs a scrape window before PodMetrics objects exist, so a rolling
+// Deployment lists empty while its containers run, and summing that to zero
+// would publish a reading the agent never took.
 func (l clientsetLister) PodMetricsForSelector(ctx context.Context, namespace, selector string) (int64, int64, bool, error) {
 	if l.metrics == nil {
 		return 0, 0, false, ErrMetricsAPIUnavailable
@@ -78,6 +89,9 @@ func (l clientsetLister) PodMetricsForSelector(ctx context.Context, namespace, s
 			return 0, 0, false, ErrMetricsAPIUnavailable
 		}
 		return 0, 0, false, err
+	}
+	if len(list.Items) == 0 {
+		return 0, 0, false, nil
 	}
 	cpu, mem := sumPodMetrics(list.Items)
 	return cpu, mem, true, nil
