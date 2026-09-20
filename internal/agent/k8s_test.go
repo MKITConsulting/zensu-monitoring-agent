@@ -235,6 +235,24 @@ func TestPodMetricsForSelectorScopesTheRequest(t *testing.T) {
 	}
 }
 
+// TestPodMetricsForSelectorReportsNoDataForAnEmptyList pins the difference
+// between "every matching pod totalled zero" and "the API returned nothing to
+// total", which PodMetricsForSelector's own doc comment explains.
+func TestPodMetricsForSelectorReportsNoDataForAnEmptyList(t *testing.T) {
+	lister := NewClientsetLister(fake.NewSimpleClientset(), servePodMetrics(nil, nil))
+
+	cpu, mem, available, err := lister.PodMetricsForSelector(context.Background(), "prod", "app=api")
+	if err != nil {
+		t.Fatalf("PodMetricsForSelector: %v", err)
+	}
+	if available {
+		t.Error("available = true, want false — an empty list is no data, not a measurement of zero")
+	}
+	if cpu != 0 || mem != 0 {
+		t.Errorf("cpu, mem = %d, %d, want 0, 0", cpu, mem)
+	}
+}
+
 // TestPodMetricsForSelectorClassifiesErrors pins the two branches that decide
 // whether the agent degrades for this cluster or just for this tick. Both return
 // no samples, so only the error distinguishes them, and the auto composite

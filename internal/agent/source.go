@@ -13,18 +13,23 @@ import (
 )
 
 // Resource-metric source names, also the accepted values of
-// ZENSU_MONITORING_AGENT_RESOURCE_SOURCE.
+// ZENSU_MONITORING_AGENT_RESOURCE_SOURCE. Every name a Name() can return is an
+// alias of the canonical constant in the metrics package, so the exported label
+// set and the names reported into it cannot drift apart.
 const (
 	// SourceAuto tries metrics-server and falls through to the exposition only
-	// when the cluster has no metrics.k8s.io API and a scrape URL is set.
+	// when the cluster has no metrics.k8s.io API and a scrape URL is set. It is
+	// a configuration value only: autoSource reports whichever of the two it is
+	// currently on, never this name, which is why it is absent from
+	// obs.ResourceSources.
 	SourceAuto = "auto"
 	// SourceMetricsServer reads metrics-server and never falls through.
-	SourceMetricsServer = "metrics-server"
+	SourceMetricsServer = obs.SourceMetricsServer
 	// SourceExposition scrapes a Prometheus exposition and never reads
 	// metrics-server.
-	SourceExposition = "exposition"
+	SourceExposition = obs.SourceExposition
 	// SourceNone disables resource metrics; uptime reporting is unaffected.
-	SourceNone = "none"
+	SourceNone = obs.SourceNone
 )
 
 // ServiceTarget identifies one annotated workload to a MetricSource. PodNames
@@ -42,6 +47,16 @@ type ServiceTarget struct {
 // source falls through on; each implementation wraps it in its own concrete
 // reason, so a future primary need not borrow another's vocabulary.
 var ErrSourceUnavailable = errors.New("metric source cannot serve this cluster")
+
+// ErrMetricsReadsAllFailed reports that every pod-metrics read attempted this
+// tick failed for a reason other than an absent API. The condition is a count,
+// not a reason: a standing RBAC denial or a broken APIService produces it, and
+// so does a tick in which every read happened to fail transiently, which is
+// indistinguishable here and is treated the same. It wraps ErrSourceUnavailable so the composite
+// falls through, because a primary that answered nothing served nothing: the
+// alternative is an empty map with a nil error, which reads as a healthy tick
+// and leaves a configured exposition permanently unused.
+var ErrMetricsReadsAllFailed = fmt.Errorf("every pod metrics read failed this tick: %w", ErrSourceUnavailable)
 
 // MetricSource yields resource samples for one tick, keyed by service slug.
 //
@@ -62,8 +77,15 @@ type MetricSource interface {
 }
 
 // metricsServerSource reads per-service CPU/memory from metrics-server. It owns
-// the "no metrics-server" warn latch so the message is logged once over the
-// agent's lifetime rather than once per service per tick.
+// the "no metrics-server" warn latch so the message is logged once per OUTAGE
+// rather than once per tick; suppressing the repeat WITHIN a tick is the early
+// return's doing, not the latch's. The latch clears only after a tick in which
+// some target's read returned no error — data or not, since an empty result
+// still proves the API answered. An API that goes away, returns and goes away
+// again is two incidents, and silencing the second would leave an operator
+// reading a log that says the problem happened once, hours ago; resetting per
+// target instead would re-arm on any tick mixing a healthy target with an
+// unavailable one, logging one standing outage forever.
 type metricsServerSource struct {
 	reader ClusterReader
 	log    *slog.Logger
@@ -85,10 +107,12 @@ func (s *metricsServerSource) Name() string { return SourceMetricsServer }
 // fail identically.
 func (s *metricsServerSource) Samples(ctx context.Context, targets []ServiceTarget) (map[string][]MetricSample, error) {
 	out := make(map[string][]MetricSample, len(targets))
+	attempted, answered := false, false
 	for _, t := range targets {
 		if t.Selector == "" {
 			continue
 		}
+		attempted = true
 		cpu, mem, available, err := s.reader.PodMetricsForSelector(ctx, t.Namespace, t.Selector)
 		if err != nil {
 			if errors.Is(err, ErrMetricsAPIUnavailable) {
@@ -100,6 +124,7 @@ func (s *metricsServerSource) Samples(ctx context.Context, targets []ServiceTarg
 			s.log.Warn("read pod metrics failed; skipping metrics this tick", "service", t.Slug, "error", err)
 			continue
 		}
+		answered = true
 		if !available {
 			continue
 		}
@@ -107,6 +132,12 @@ func (s *metricsServerSource) Samples(ctx context.Context, targets []ServiceTarg
 			{Key: MetricCPUMillicores, Value: float64(cpu)},
 			{Key: MetricMemoryBytes, Value: float64(mem)},
 		}
+	}
+	if answered {
+		s.warned.Store(false)
+	}
+	if attempted && !answered {
+		return nil, ErrMetricsReadsAllFailed
 	}
 	return out, nil
 }

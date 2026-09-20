@@ -168,24 +168,43 @@ func TestResourceSamplesAreRoleGranular(t *testing.T) {
 // scrape, so a zero rate reads the same as a healthy tick and as a stopped
 // exposition.
 func TestResourceSourceNamesTheActiveSource(t *testing.T) {
-	client := fake.NewSimpleClientset(deployment("default", "api", "api", 1, 1))
-	m := obs.NewWithRegistry(prometheus.NewRegistry())
-	a := New(Config{ProductID: "p", Namespaces: []string{"default"}},
-		NewClientsetLister(client, nil), &stubReporter{}, nil,
-		&roleSource{name: SourceExposition})
-	a.Metrics = m
-
-	if _, err := a.Collect(context.Background()); err != nil {
-		t.Fatalf("Collect: %v", err)
+	cases := []struct {
+		active  string
+		samples []MetricSample
+	}{
+		// The mapped row matters: without it every assertion here would run on a
+		// tick that produced no samples, and a guard that reported the source
+		// only on empty ticks would pass.
+		{active: SourceExposition, samples: []MetricSample{{Key: MetricCPUMillicores, Value: 250}}},
+		{active: SourceMetricsServer},
+		{active: SourceNone},
 	}
+	for _, c := range cases {
+		t.Run(c.active, func(t *testing.T) {
+			active := c.active
+			client := fake.NewSimpleClientset(deployment("default", "api", "api", 1, 1))
+			m := obs.NewWithRegistry(prometheus.NewRegistry())
+			a := New(Config{ProductID: "p", Namespaces: []string{"default"}},
+				NewClientsetLister(client, nil), &stubReporter{}, nil,
+				&roleSource{name: active, samples: c.samples})
+			a.Metrics = m
 
-	body := scrapeMetrics(t, m)
-	if !strings.Contains(body, `zensu_monitoring_agent_resource_source{source="exposition"} 1`) {
-		t.Errorf("the active source must read 1; body:\n%s", body)
-	}
-	for _, other := range []string{"metrics-server", "none"} {
-		if !strings.Contains(body, `zensu_monitoring_agent_resource_source{source="`+other+`"} 0`) {
-			t.Errorf("inactive source %q must read 0 rather than be absent; body:\n%s", other, body)
-		}
+			if _, err := a.Collect(context.Background()); err != nil {
+				t.Fatalf("Collect: %v", err)
+			}
+
+			body := scrapeMetrics(t, m)
+			if !strings.Contains(body, `zensu_monitoring_agent_resource_source{source="`+active+`"} 1`) {
+				t.Errorf("the active source %q must read 1; body:\n%s", active, body)
+			}
+			for _, other := range obs.ResourceSources {
+				if other == active {
+					continue
+				}
+				if !strings.Contains(body, `zensu_monitoring_agent_resource_source{source="`+other+`"} 0`) {
+					t.Errorf("inactive source %q must read 0 rather than be absent; body:\n%s", other, body)
+				}
+			}
+		})
 	}
 }
