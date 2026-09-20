@@ -2,7 +2,9 @@ package metrics
 
 import (
 	"context"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -347,5 +349,42 @@ func TestSetResourceSourceFlagsAnUnlistedName(t *testing.T) {
 		if got := testutil.ToFloat64(m.resourceSource.WithLabelValues(source)); got != 0 {
 			t.Errorf("%s = %v, want 0 — only the unknown series reports an unlisted name", source, got)
 		}
+	}
+}
+
+// TestServeReturnsTheListenError pins that a listener which cannot start is
+// reported rather than swallowed. A port already in use is the ordinary way this
+// happens — two agents on one host, or a sidecar holding the same port — and the
+// caller logs what Serve returns, so silence here would leave /metrics
+// permanently absent with nothing saying why. The graceful-shutdown return is
+// pinned by TestServeGracefulShutdown; this one asserts the listen failure
+// positively, so a mutant returning some other error cannot pass.
+func TestServeReturnsTheListenError(t *testing.T) {
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port: %v", err)
+	}
+	defer taken.Close()
+
+	m := NewWithRegistry(prometheus.NewRegistry())
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel on the way out so the server has a shutdown path even if
+	// ListenAndServe unexpectedly succeeded and this test failed on the timeout.
+	t.Cleanup(cancel)
+
+	done := make(chan error, 1)
+	go func() { done <- m.Serve(ctx, taken.Addr().String()) }()
+
+	select {
+	case err := <-done:
+		var opErr *net.OpError
+		if !errors.As(err, &opErr) {
+			t.Fatalf("err = %v, want a *net.OpError from the listener", err)
+		}
+		if opErr.Op != "listen" {
+			t.Errorf("op = %q, want %q", opErr.Op, "listen")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not report the listen failure within 5s")
 	}
 }

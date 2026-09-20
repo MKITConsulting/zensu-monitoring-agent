@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	obs "github.com/MKITConsulting/zensu-monitoring-agent/internal/metrics"
 	"github.com/MKITConsulting/zensu-monitoring-agent/internal/redact"
 )
 
@@ -139,5 +144,79 @@ func TestReporterTrimsTrailingSlashFromBaseURL(t *testing.T) {
 	gotPath := <-paths
 	if gotPath != "/api/runtime/heartbeat" {
 		t.Errorf("path = %q, want no doubled slash", gotPath)
+	}
+}
+
+// mustNotDial fails the test if any request is attempted. It turns "this call
+// never reaches the network" from a claim in a doc comment into an assertion.
+type mustNotDial struct{ t *testing.T }
+
+func (d mustNotDial) RoundTrip(req *http.Request) (*http.Response, error) {
+	d.t.Errorf("no request may be issued, got %s %s", req.Method, req.URL)
+	return nil, errors.New("mustNotDial")
+}
+
+// TestReporterSendRefusesANonFiniteMetric pins the last line of defence against a
+// value JSON cannot carry. The exposition source already drops non-finite
+// samples, so this guard sits behind that one: a value that still reaches Send
+// must fail the whole batch before anything is written to the network, and the
+// attempt must still be counted as a failed heartbeat — the deferred
+// RecordHeartbeat has to fire even on a path that never builds a request.
+func TestReporterSendRefusesANonFiniteMetric(t *testing.T) {
+	cases := []struct {
+		name  string
+		value float64
+	}{
+		{"NaN", math.NaN()},
+		{"positive infinity", math.Inf(1)},
+		{"negative infinity", math.Inf(-1)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			m := obs.NewWithRegistry(prometheus.NewRegistry())
+			rep := NewReporter("http://zensu.example", "k", 5*time.Second)
+			rep.Metrics = m
+			rep.Client = &http.Client{Transport: mustNotDial{t: t}}
+
+			err := rep.Send(context.Background(), HeartbeatBatch{ProductID: "p", Services: []ServiceHeartbeat{{
+				Slug:    "api",
+				Status:  StatusUp,
+				Metrics: []MetricSample{{Key: MetricCPUMillicores, Value: c.value}},
+			}}})
+			if err == nil {
+				t.Fatal("expected Send to refuse a batch JSON cannot encode")
+			}
+			if !strings.Contains(err.Error(), "unsupported value") {
+				t.Errorf("err = %v, want it to name the encoding failure", err)
+			}
+			body := scrapeMetrics(t, m)
+			if !strings.Contains(body, `zensu_monitoring_agent_heartbeat_total{result="error"} 1`) {
+				t.Errorf("an unencodable batch must count as a failed heartbeat; body:\n%s", body)
+			}
+		})
+	}
+}
+
+// TestReporterSendRejectsAnUnbuildableRequest pins that a base URL the HTTP
+// package cannot turn into a request fails before anything reaches the network.
+// Startup cannot produce such a URL — ValidateAPIURL refuses it through the same
+// url.Parse that would fail here — so this guards a caller that sets the
+// exported BaseURL field directly.
+//
+// Note what is deliberately NOT asserted: this branch returns the *url.Error
+// bare, so it echoes the configured URL, unlike Send's transport branch
+// (TestReporterTransportErrorOmitsTheURL) and unlike the identical call in the
+// scrape client, which wraps it in redact.TransportReason. That asymmetry is
+// reported as a defect rather than pinned here.
+func TestReporterSendRejectsAnUnbuildableRequest(t *testing.T) {
+	rep := NewReporter("http://zensu.example\x7f", "k", time.Second)
+	rep.Client = &http.Client{Transport: mustNotDial{t: t}}
+
+	err := rep.Send(context.Background(), HeartbeatBatch{ProductID: "p"})
+	if err == nil {
+		t.Fatal("expected Send to refuse a base URL it cannot build a request from")
+	}
+	if !strings.Contains(err.Error(), "invalid control character") {
+		t.Errorf("err = %v, want the request-build failure rather than a transport or status error", err)
 	}
 }

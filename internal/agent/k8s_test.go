@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -298,5 +299,82 @@ func TestPodMetricsForSelectorClassifiesErrors(t *testing.T) {
 				t.Errorf("err = %v, want the API's own error verbatim (%v)", err, c.reaction)
 			}
 		})
+	}
+}
+
+// deniedLister returns a ClusterReader whose list call for one resource is
+// refused by the API server in every namespace. It wraps the real
+// clientsetLister, so the refusal travels the path a cluster actually produces
+// rather than a hand-written stub's approximation of it.
+func deniedLister(resource string, refusal error, objects ...runtime.Object) ClusterReader {
+	return deniedListerInNamespace(resource, "", refusal, objects...)
+}
+
+// deniedListerInNamespace refuses the list in one namespace only, so a
+// collection spanning several can be made to succeed before it fails. That is
+// what distinguishes "aborted" from "had nothing yet".
+func deniedListerInNamespace(resource, namespace string, refusal error, objects ...runtime.Object) ClusterReader {
+	client := fake.NewSimpleClientset(objects...)
+	client.PrependReactor("list", resource, func(a k8stesting.Action) (bool, runtime.Object, error) {
+		if namespace != "" && a.GetNamespace() != namespace {
+			return false, nil, nil
+		}
+		return true, nil, refusal
+	})
+	return NewClientsetLister(client, nil)
+}
+
+// TestListDeploymentsReturnsTheAPIError pins that a refused list is reported
+// rather than read as an empty namespace. To the caller the two have the same
+// shape — no items — and the difference decides whether a tick reports zero
+// services or aborts, so passing the error through is a contract, not a detail.
+// errors.Is rather than identity: the contract is that the refusal stays
+// recoverable and is not reclassified, not that the pointer survives.
+func TestListDeploymentsReturnsTheAPIError(t *testing.T) {
+	refusal := apierrors.NewForbidden(schema.GroupResource{Group: "apps", Resource: "deployments"}, "", errors.New("no list permission"))
+
+	got, err := deniedLister("deployments", refusal).ListDeployments(context.Background(), "default")
+	if !errors.Is(err, refusal) {
+		t.Fatalf("err = %v, want the API refusal", err)
+	}
+	if got != nil {
+		t.Errorf("a refused list must yield no items, got %d", len(got))
+	}
+}
+
+// TestListPodsReturnsTheAPIError is the ListDeployments case for the pod read.
+// It is separate because the two calls carry different RBAC verbs, and a cluster
+// can grant one without the other.
+func TestListPodsReturnsTheAPIError(t *testing.T) {
+	refusal := apierrors.NewForbidden(schema.GroupResource{Resource: "pods"}, "", errors.New("no list permission"))
+
+	got, err := deniedLister("pods", refusal).ListPods(context.Background(), "default", "app=api")
+	if !errors.Is(err, refusal) {
+		t.Fatalf("err = %v, want the API refusal", err)
+	}
+	if got != nil {
+		t.Errorf("a refused list must yield no pods, got %d", len(got))
+	}
+}
+
+// TestNewInClusterListerRefusesOutsideACluster pins the constructor's first
+// failure and the stage name it carries. It is what an operator sees when the
+// ServiceAccount is not mounted, and an unnamed error there sends them looking
+// at the API URL instead of at the pod spec. The other two refusals and the
+// success path stay uncovered: rest.InClusterConfig reads the token and CA from
+// fixed paths under /var/run/secrets, which no test can provide.
+func TestNewInClusterListerRefusesOutsideACluster(t *testing.T) {
+	t.Setenv("KUBERNETES_SERVICE_HOST", "")
+	t.Setenv("KUBERNETES_SERVICE_PORT", "")
+
+	reader, err := NewInClusterLister()
+	if err == nil {
+		t.Fatal("expected NewInClusterLister to refuse without in-cluster config")
+	}
+	if reader != nil {
+		t.Errorf("a refused constructor must yield no reader, got %#v", reader)
+	}
+	if !strings.Contains(err.Error(), "in-cluster config") {
+		t.Errorf("err = %v, want it to name the stage that refused", err)
 	}
 }

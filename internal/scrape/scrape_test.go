@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -695,5 +696,109 @@ func TestLenPrefixedSizeMatchesWhatIsWritten(t *testing.T) {
 			t.Errorf("lenPrefixedSize(len %d) = %d, want %d — the estimate must equal what writeLenPrefixed emits",
 				len(s), got, want)
 		}
+	}
+}
+
+// TestFetchReportsATruncatedBody pins the read that fails after the status line
+// was already accepted. An exposition endpoint killed mid-response — an
+// OOM-killed collector, a proxy giving up — answers 200 and then stops, and
+// without this branch the partial bytes would be parsed as a complete
+// exposition, silently reporting a subset of the series as the whole of them.
+//
+// It drives a real server rather than a stubbed transport on purpose: the claim
+// includes the boundary fact that net/http surfaces a mid-response abort as a
+// read error at all, which a hand-made body would assume rather than prove.
+func TestFetchReportsATruncatedBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		w.Header().Set("Content-Length", fmt.Sprint(len(sampleExposition)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(sampleExposition[:10]))
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler)
+	}))
+	defer srv.Close()
+
+	series, err := NewClient(srv.URL+"/metrics?token=s3cret", 0).Fetch(context.Background(), nil)
+	if err == nil {
+		t.Fatal("a body that stops mid-response must not be parsed as complete")
+	}
+	if series != nil {
+		t.Errorf("a failed read must yield no series, got %d", len(series))
+	}
+
+	const prefix = "scrape: read body: "
+	if !strings.HasPrefix(err.Error(), prefix) {
+		t.Fatalf("err = %v, want it to name the stage that failed", err)
+	}
+	reason := strings.TrimPrefix(err.Error(), prefix)
+	if reason == "" {
+		t.Error("the read failure must keep its reason after redaction")
+	}
+	if len(reason) > redact.SnippetBytes+64 {
+		t.Errorf("reason is %d bytes, want it bounded by redaction", len(reason))
+	}
+	for _, r := range reason {
+		if r < 0x20 || r > 0x7e {
+			t.Errorf("reason carries a non-printable rune %q; redaction must strip it", r)
+			break
+		}
+	}
+	if strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), srv.URL) {
+		t.Errorf("err = %v, want the endpoint and its query kept out of the message", err)
+	}
+}
+
+// errReader fails every read with a fixed error, so a response body can be made
+// to break after its headers were accepted.
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// hostileBodyTransport answers 200 with a body whose read fails carrying
+// peer-shaped bytes.
+type hostileBodyTransport struct{ err error }
+
+func (t hostileBodyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/plain; version=0.0.4"}},
+		Body:       io.NopCloser(errReader{err: t.err}),
+		Request:    req,
+	}, nil
+}
+
+// TestFetchRedactsTheReadFailure pins the redaction on the read-body branch.
+// TestFetchReportsATruncatedBody cannot do it: a real aborted response yields
+// net/http's own wording, which is short and printable, so removing the
+// redaction there changes nothing observable. Only a body error carrying the
+// peer's bytes shows what the bound and the strip are for — and a collector that
+// can be made to emit them is exactly the threat the redact package exists for.
+func TestFetchRedactsTheReadFailure(t *testing.T) {
+	hostile := errors.New("peer said \x00\x1b[31m" + strings.Repeat("A", redact.SnippetBytes*4))
+	c := NewClient("http://collector.example/metrics?token=s3cret", 0)
+	c.HTTP = &http.Client{Transport: hostileBodyTransport{err: hostile}}
+
+	_, err := c.Fetch(context.Background(), nil)
+	if err == nil {
+		t.Fatal("a body that cannot be read must not be parsed as complete")
+	}
+
+	const prefix = "scrape: read body: "
+	if !strings.HasPrefix(err.Error(), prefix) {
+		t.Fatalf("err = %v, want it to name the stage that failed", err)
+	}
+	reason := strings.TrimPrefix(err.Error(), prefix)
+	if len(reason) > redact.SnippetBytes+64 {
+		t.Errorf("reason is %d bytes, want redaction to bound it", len(reason))
+	}
+	for _, r := range reason {
+		if r < 0x20 || r > 0x7e {
+			t.Errorf("reason carries a non-printable rune %q; redaction must strip it", r)
+			break
+		}
+	}
+	if strings.Contains(err.Error(), "s3cret") {
+		t.Errorf("err = %v, want the endpoint's query kept out of the message", err)
 	}
 }

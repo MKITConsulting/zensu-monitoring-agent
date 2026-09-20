@@ -810,3 +810,106 @@ func TestWarnDuplicateSlugLatchesPerPair(t *testing.T) {
 		t.Errorf("a new shadowing workload must be reported, got %d lines", got)
 	}
 }
+
+// spyTargetSource records the targets one tick handed the metric source, so a
+// test can assert what Collect passed on rather than only what it returned.
+type spyTargetSource struct{ targets []ServiceTarget }
+
+func (s *spyTargetSource) Name() string { return SourceNone }
+
+func (s *spyTargetSource) Samples(_ context.Context, targets []ServiceTarget) (map[string][]MetricSample, error) {
+	s.targets = targets
+	return nil, nil
+}
+
+// TestCollect_AbortsWhenDeploymentsCannotBeListed pins that a refused Deployment
+// list fails the tick and discards what it had already gathered. A namespace the
+// agent may not read looks exactly like a namespace with no workloads, and
+// reporting a partial batch would tell the backend every service missing from it
+// has gone away. The first namespace deliberately succeeds: without it the
+// discard is indistinguishable from having collected nothing yet.
+func TestCollect_AbortsWhenDeploymentsCannotBeListed(t *testing.T) {
+	refusal := errors.New("deployments are not readable")
+	a := New(Config{ProductID: "p", Namespaces: []string{"ns1", "ns2"}},
+		deniedListerInNamespace("deployments", "ns2", refusal, deployment("ns1", "api", "api", 1, 1)),
+		&stubReporter{}, nil, noneSource{})
+
+	services, err := a.Collect(context.Background())
+	if !errors.Is(err, refusal) {
+		t.Fatalf("err = %v, want the lister's refusal", err)
+	}
+	if services != nil {
+		t.Errorf("a failed collection must discard what it gathered, got %d services", len(services))
+	}
+}
+
+// TestCollect_KeepsTheServiceWhenPodsCannotBeListed pins what a refused Pod list
+// does and does not cost. The service is still reported, because dropping it
+// would tell the backend a running workload had disappeared. It loses its
+// restart count AND its pod names, and the missing names cost it pod-labelled
+// attribution in the exposition source, which builds its index from PodNames
+// alone. The selector survives, so a selector-based source is unaffected.
+func TestCollect_KeepsTheServiceWhenPodsCannotBeListed(t *testing.T) {
+	var logged strings.Builder
+	src := &spyTargetSource{}
+	a := New(Config{ProductID: "p", Namespaces: []string{"default"}},
+		deniedLister("pods", errors.New("pods are not readable"), deployment("default", "api", "api", 1, 1)),
+		&stubReporter{},
+		slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelWarn})), src)
+
+	services, err := a.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect: %v", err)
+	}
+	if len(services) != 1 {
+		t.Fatalf("got %d services, want the workload reported despite the pod refusal", len(services))
+	}
+
+	got := services[0]
+	if got.Slug != "api" || got.Name != "api" || got.Status != StatusUp {
+		t.Errorf("slug/name/status = %q/%q/%q, want api/api/%s", got.Slug, got.Name, got.Status, StatusUp)
+	}
+	if got.ReadyReplicas == nil || *got.ReadyReplicas != 1 {
+		t.Errorf("ReadyReplicas = %v, want 1 — the pod refusal must not touch it", got.ReadyReplicas)
+	}
+	if got.DesiredReplicas == nil || *got.DesiredReplicas != 1 {
+		t.Errorf("DesiredReplicas = %v, want 1 — the pod refusal must not touch it", got.DesiredReplicas)
+	}
+	if got.RestartCount != nil {
+		t.Errorf("RestartCount = %d, want it absent rather than a fabricated zero", *got.RestartCount)
+	}
+
+	if len(src.targets) != 1 {
+		t.Fatalf("got %d targets, want the service still offered to the source", len(src.targets))
+	}
+	if src.targets[0].Selector == "" {
+		t.Error("the selector must survive, so a selector-based source still resolves the service")
+	}
+	if len(src.targets[0].PodNames) != 0 {
+		t.Errorf("PodNames = %v, want empty — a refused list produced no names", src.targets[0].PodNames)
+	}
+
+	if !strings.Contains(logged.String(), "list pods for restartCount failed") {
+		t.Errorf("the refusal must be logged; log:\n%s", logged.String())
+	}
+	if !strings.Contains(logged.String(), "deployment=api") {
+		t.Errorf("the log line must name the workload; log:\n%s", logged.String())
+	}
+}
+
+// TestTick_PropagatesTheCollectError pins that a failed collection stops the tick
+// before the POST. Sending what was gathered so far would report a subset of the
+// cluster as the whole of it.
+func TestTick_PropagatesTheCollectError(t *testing.T) {
+	refusal := errors.New("deployments are not readable")
+	rep := &stubReporter{}
+	a := New(Config{ProductID: "p", Namespaces: []string{"default"}},
+		deniedLister("deployments", refusal), rep, nil, noneSource{})
+
+	if err := a.Tick(context.Background()); !errors.Is(err, refusal) {
+		t.Fatalf("err = %v, want the collection failure", err)
+	}
+	if rep.calls != 0 {
+		t.Errorf("Tick POSTed %d times after a failed collection, want 0", rep.calls)
+	}
+}
