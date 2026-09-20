@@ -2,14 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/MKITConsulting/zensu-monitoring-agent/internal/agent"
@@ -205,6 +212,10 @@ func startupEnv(t *testing.T) {
 	t.Setenv("ZENSU_PRODUCT_ID", "p")
 	t.Setenv("ZENSU_MONITORING_AGENT_NAMESPACES", "default")
 	t.Setenv("ZENSU_MONITORING_AGENT_METRICS_ADDR", "127.0.0.1:0")
+	t.Setenv("ZENSU_MONITORING_AGENT_METRICS_ENABLED", "true")
+	t.Setenv("ZENSU_MONITORING_AGENT_INTERVAL", "")
+	t.Setenv("ZENSU_MONITORING_AGENT_RESOURCE_SOURCE", "")
+	t.Setenv("ZENSU_MONITORING_AGENT_SCRAPE_URL", "")
 }
 
 // runStartup drives run() to the point where startup either refuses or the agent
@@ -415,5 +426,200 @@ func TestEnvLogLevel(t *testing.T) {
 				t.Errorf("envLogLevel() = %v, want %v", got, c.want)
 			}
 		})
+	}
+}
+
+// TestEnvList pins the fallback that keeps a blank value from narrowing the
+// agent to no namespaces at all. A value holding only separators is ordinary
+// chart output, and without the guard it would produce an empty list — which
+// lists nothing rather than everything.
+func TestEnvList(t *testing.T) {
+	def := []string{"default"}
+	cases := []struct {
+		name string
+		val  string
+		want []string
+	}{
+		{"unset falls back", "", def},
+		{"single value", "prod", []string{"prod"}},
+		{"comma separated and trimmed", " a , b ,c ", []string{"a", "b", "c"}},
+		{"blank entries are dropped", "a,,b", []string{"a", "b"}},
+		{"only separators falls back", " , , ", def},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("ZENSU_MONITORING_AGENT_NAMESPACES", c.val)
+			if got := envList("ZENSU_MONITORING_AGENT_NAMESPACES", def); !slices.Equal(got, c.want) {
+				t.Errorf("envList() = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// annotatedLister serves one annotated Deployment, so a tick has something to
+// report and the heartbeat path is actually reached.
+func annotatedLister() (agent.ClusterReader, error) {
+	desired := int32(1)
+	d := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "api",
+			Annotations: map[string]string{agent.AnnotationService: "api"},
+		},
+		Spec:   appsv1.DeploymentSpec{Replicas: &desired},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 1},
+	}
+	return agent.NewClientsetLister(fake.NewSimpleClientset(d), nil), nil
+}
+
+// TestRunReportsAFailingKubernetesClient pins that a client the agent cannot
+// build stops startup with the stage named. It is the first thing that fails
+// when the ServiceAccount is not mounted, and an unnamed error there sends an
+// operator looking at the API URL instead of at the pod spec.
+func TestRunReportsAFailingKubernetesClient(t *testing.T) {
+	startupEnv(t)
+	refusal := errors.New("no service account token")
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := run(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), false,
+		func() (agent.ClusterReader, error) { return nil, refusal })
+	if !errors.Is(err, refusal) {
+		t.Fatalf("err = %v, want the constructor's refusal", err)
+	}
+	if !strings.Contains(err.Error(), "kubernetes client") {
+		t.Errorf("err = %v, want it to name the stage that refused", err)
+	}
+}
+
+// TestRunReturnsTheAgentError pins that a tick the backend refused reaches the
+// caller, which is what makes a CronJob run exit non-zero. Swallowing it would
+// leave a failed one-shot indistinguishable from a successful one, and the
+// CronJob's own failure count is the only alarm a one-shot deployment has. The
+// assertion names the backend's refusal rather than accepting any error, because
+// every startup stage above this one also returns non-nil.
+func TestRunReturnsTheAgentError(t *testing.T) {
+	startupEnv(t)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer backend.Close()
+	t.Setenv("ZENSU_API_URL", backend.URL)
+	t.Setenv("ZENSU_MONITORING_AGENT_RESOURCE_SOURCE", agent.SourceNone)
+
+	err := run(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), true, annotatedLister)
+	if err == nil || !strings.Contains(err.Error(), "heartbeat rejected (500)") {
+		t.Fatalf("err = %v, want the backend's refusal", err)
+	}
+}
+
+// TestRunSwallowsTheAgentErrorOnShutdown pins the other half of the same guard:
+// a tick that fails while the context is already cancelled must NOT fail the
+// run. Without it a SIGTERM during a rollout would exit 1 and report an orderly
+// shutdown as a crash.
+func TestRunSwallowsTheAgentErrorOnShutdown(t *testing.T) {
+	startupEnv(t)
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer backend.Close()
+	t.Setenv("ZENSU_API_URL", backend.URL)
+	t.Setenv("ZENSU_MONITORING_AGENT_RESOURCE_SOURCE", agent.SourceNone)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if err := run(ctx, slog.New(slog.NewTextHandler(io.Discard, nil)), true, annotatedLister); err != nil {
+		t.Fatalf("a failing tick under a cancelled context must not fail the run, got %v", err)
+	}
+}
+
+// logRecord is one captured log line: the level an alert rule matches on, the
+// message, and the attributes that carry the reason.
+type logRecord struct {
+	level slog.Level
+	msg   string
+	attrs map[string]string
+}
+
+// logSink publishes every record on a channel, so a test can wait for a line
+// written by a goroutine instead of racing a shared buffer. A record dropped
+// because the buffer was full would present as a timeout with no explanation, so
+// drops are counted and asserted rather than swallowed silently.
+type logSink struct {
+	records chan logRecord
+	dropped *atomic.Int32
+}
+
+func (s logSink) Enabled(context.Context, slog.Level) bool { return true }
+
+func (s logSink) Handle(_ context.Context, r slog.Record) error {
+	rec := logRecord{level: r.Level, msg: r.Message, attrs: map[string]string{}}
+	r.Attrs(func(a slog.Attr) bool {
+		rec.attrs[a.Key] = a.Value.String()
+		return true
+	})
+	select {
+	case s.records <- rec:
+	default:
+		s.dropped.Add(1)
+	}
+	return nil
+}
+
+func (s logSink) WithAttrs([]slog.Attr) slog.Handler { return s }
+
+func (s logSink) WithGroup(string) slog.Handler { return s }
+
+// TestRunLogsAMetricsServerThatCannotListen pins the only report an operator
+// gets when the metrics port is already taken. The listener runs in its own
+// goroutine and its failure never reaches run's return value, so without this
+// line /metrics stays unreachable while the agent looks healthy. The level and
+// the reason are asserted too: an alert rule matches on ERROR, and a message
+// with no reason tells the operator nothing.
+func TestRunLogsAMetricsServerThatCannotListen(t *testing.T) {
+	startupEnv(t)
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve a port: %v", err)
+	}
+	defer taken.Close()
+	t.Setenv("ZENSU_MONITORING_AGENT_METRICS_ADDR", taken.Addr().String())
+	t.Setenv("ZENSU_MONITORING_AGENT_RESOURCE_SOURCE", agent.SourceNone)
+
+	var dropped atomic.Int32
+	sink := logSink{records: make(chan logRecord, 256), dropped: &dropped}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- run(ctx, slog.New(sink), false, fakeLister) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("run did not return within 5s of ctx cancel")
+		}
+	})
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case rec := <-sink.records:
+			if rec.msg != "metrics server stopped" {
+				continue
+			}
+			if rec.level != slog.LevelError {
+				t.Errorf("level = %v, want %v so an alert rule can match it", rec.level, slog.LevelError)
+			}
+			if rec.attrs["error"] == "" {
+				t.Errorf("the line must carry the reason, got attrs %v", rec.attrs)
+			}
+			if got := dropped.Load(); got != 0 {
+				t.Errorf("%d log records were dropped; the sink buffer is too small", got)
+			}
+			return
+		case <-deadline:
+			t.Fatal("the metrics listener failure was never logged")
+		}
 	}
 }
